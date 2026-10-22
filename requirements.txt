@@ -1,0 +1,10 @@
+python-telegram-bot[job-queue]>=21.0
+Flask>=3.0
+requests>=2.32
+edge-tts>=7.0
+gTTS>=2.5
+imageio-ffmpeg>=0.5
+yt-dlp>=2024.8
+Pillow>=10.0
+pypdf>=4.0
+qrcode>=7.4
