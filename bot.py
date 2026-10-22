@@ -1473,11 +1473,12 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_photo(photo=img, caption="🖼️ আপনার AI ছবি!")
             bump(chat_id, "images")
         elif mode == "download":
-            if "http" not in text:
+            urlm = re.search(r"https?://\S+", text)
+            if not urlm:
                 await update.message.reply_text("সঠিক লিংক পাঠান (http দিয়ে শুরু)।")
                 return
             await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_VIDEO)
-            path = await asyncio.to_thread(download_video, text.strip())
+            path = await asyncio.to_thread(download_video, urlm.group(0))
             try:
                 if os.path.getsize(path) > 49 * 1024 * 1024:
                     await update.message.reply_text("⚠️ ভিডিও ৫০MB-এর বেশি — বটে পাঠানো যায় না।")
