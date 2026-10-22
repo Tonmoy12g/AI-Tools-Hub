@@ -3,7 +3,7 @@
 """
 Complete Multi-Tool Bangla Telegram Bot (bot.py)
 Tech stack:
-- python-telegram-bot v21+ (with job-queue, long polling)
+- python-telegram-bot v21+ (with job-queue, long polling, Python 3.10–3.14+ compatible)
 - Flask background keep-alive server on PORT (default 10000)
 - SQLite database (bigbot.db)
 - Groq API (dynamic model discovery & fallback, Whisper STT)
@@ -3237,6 +3237,11 @@ def main() -> None:
         logger.error("TELEGRAM_BOT_TOKEN environment variable is missing! Waiting on Flask thread...")
         flask_thread.join()
         return
+
+    # Python 3.14+ removed implicit event loop creation in asyncio.get_event_loop().
+    # Explicitly create and set an event loop on the main thread before building/running Application.
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
 
     application: Application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 
