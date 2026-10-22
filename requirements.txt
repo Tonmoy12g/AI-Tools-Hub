@@ -2,9 +2,3 @@ python-telegram-bot>=20.0
 flask
 requests
 edge-tts
-gTTS
-Pillow
-pypdf
-qrcode
-yt-dlp
-imageio-ffmpeg
