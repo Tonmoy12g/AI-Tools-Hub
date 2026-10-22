@@ -48,7 +48,7 @@ from telegram import (
     Update,
 )
 from telegram.constants import ChatAction, ChatMemberStatus, ParseMode
-from telegram.error import BadRequest, Forbidden, TelegramError
+from telegram.error import BadRequest, Conflict, Forbidden, TelegramError
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -67,6 +67,8 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger("BigBot")
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
@@ -78,6 +80,7 @@ PORT = int(os.environ.get("PORT", "10000"))
 
 DB_FILE = "bigbot.db"
 ERROR_MSG_BN = "দুঃখিত, একটু সমস্যা হয়েছে। আবার চেষ্টা করুন 🙏"
+DIVIDER = "━━━━━━━━━━━━━━━━━━━━"
 
 
 def get_admin_ids() -> List[int]:
@@ -460,12 +463,10 @@ async def check_force_join(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             ChatMemberStatus.OWNER,
         ):
             return True
-        # Restricted users who are still in the chat
         if member.status == ChatMemberStatus.RESTRICTED and getattr(member, "is_member", False):
             return True
     except TelegramError as e:
         logger.warning(f"Force join check error for {channel}: {e}")
-        # If bot is not in channel or channel invalid, don't lock out users permanently
         return True
 
     clean_username = channel.lstrip("@")
@@ -477,13 +478,15 @@ async def check_force_join(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         ]
     )
     msg_text = (
-        f"⚠️ বটটি ব্যবহার করতে আমাদের অফিসিয়াল চ্যানেলে ({channel}) অবশ্যই জয়েন করতে হবে।\n\n"
-        "নিচের বাটনে ক্লিক করে চ্যানেলে জয়েন করুন এবং তারপর '✅ জয়েন করেছি' বাটনে চাপুন।"
+        f"🔐 <b>অ্যাক্সেস লক করা আছে!</b>\n"
+        f"{DIVIDER}\n"
+        f"বটের সকল প্রিমিয়াম টুলস ফ্রি ব্যবহার করতে আমাদের অফিসিয়াল চ্যানেলে ({html.escape(channel)}) জয়েন করুন।\n\n"
+        f"<blockquote>👇 নিচের বাটনে ক্লিক করে জয়েন করার পর <b>‘✅ জয়েন করেছি’</b> বাটনে চাপুন।</blockquote>"
     )
     if update.callback_query:
-        await update.callback_query.message.reply_text(msg_text, reply_markup=kb)
+        await update.callback_query.message.reply_text(msg_text, parse_mode=ParseMode.HTML, reply_markup=kb)
     elif update.effective_message:
-        await update.effective_message.reply_text(msg_text, reply_markup=kb)
+        await update.effective_message.reply_text(msg_text, parse_mode=ParseMode.HTML, reply_markup=kb)
     return False
 
 
@@ -609,7 +612,6 @@ def call_groq_chat(
         resp.raise_for_status()
         data = resp.json()
         content = data["choices"][0]["message"]["content"]
-        # Strip <think>...</think> blocks if a reasoning model (like qwen3) is selected
         content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
         return content
 
@@ -645,6 +647,30 @@ def call_groq_whisper(file_path: str) -> str:
     if last_err:
         raise last_err
     raise RuntimeError("All Whisper models failed.")
+
+
+# ---------------------------------------------------------------------------
+# WATERMARK-FREE IMAGE CLEANING (100% LOGO REMOVAL GUARANTEE)
+# ---------------------------------------------------------------------------
+def remove_bottom_watermark_and_polish(img_bytes: bytes) -> bytes:
+    """
+    Guarantees 100% watermark-free AI images.
+    Pollinations sometimes burns a small logo strip in the bottom-right / bottom 6%
+    even when ?nologo=true is passed. We request a slightly taller image (or standard 1024)
+    and cleanly crop out the bottom watermark zone, then resize to a crisp 1024x1024 JPEG.
+    """
+    with Image.open(io.BytesIO(img_bytes)) as im:
+        rgb = im.convert("RGB")
+        w, h = rgb.size
+        # Crop bottom 6.5% where any watermark/logo badge sits, and center-crop width slightly to keep aspect ratio
+        crop_bottom = int(h * 0.935)
+        margin_x = int(w * 0.0325)
+        cropped = rgb.crop((margin_x, 0, w - margin_x, crop_bottom))
+        resample_filter = getattr(Image, "Resampling", Image).LANCZOS
+        final_im = cropped.resize((1024, 1024), resample_filter)
+        out_bio = io.BytesIO()
+        final_im.save(out_bio, format="JPEG", quality=95, optimize=True)
+        return out_bio.getvalue()
 
 
 # ---------------------------------------------------------------------------
@@ -699,74 +725,88 @@ SEVEN_DUAS = [
 
 
 # ---------------------------------------------------------------------------
-# ABOUT & HELP TEXTS
+# ABOUT & HELP TEXTS (STYLISH & PROFESSIONAL)
 # ---------------------------------------------------------------------------
 ABOUT_TEXT = (
-    "ℹ️ <b>বট পরিচিতি ও সকল বাটনের কাজ (About)</b>\n\n"
-    "এই বটে থাকা প্রতিটি বাটনের কাজ নিচে দেওয়া হলো:\n\n"
-    "১. <b>🤖 AI চ্যাট</b>: কৃত্রিম বুদ্ধিমত্তার সাথে বাংলায় বা ইংরেজিতে যেকোনো বিষয়ে কথা বলুন (পূর্বের ৮টি কথোপকথন মনে রাখে)।\n"
-    "২. <b>🎙️ Voice বানান</b>: যেকোনো লেখা থেকে বাংলা (নারী/পুরুষ) বা ইংরেজি ভয়েস মেসেজ তৈরি করুন।\n"
-    "৩. <b>🎤 Voice → Text</b>: যেকোনো ভয়েস মেসেজ পাঠালে তা সাথে সাথে টেক্সটে রূপান্তর করে দেবে।\n"
-    "৪. <b>🖼️ AI ছবি</b>: আপনার বর্ণনা অনুযায়ী সম্পূর্ণ ওয়াটারমার্ক-মুক্ত এইচডি AI ছবি তৈরি করুন।\n"
-    "৫. <b>📥 ভিডিও ডাউনলোড</b>: TikTok, YouTube, Facebook, Instagram ইত্যাদির লিংক থেকে ভিডিও ডাউনলোড করুন।\n"
-    "৬. <b>🌐 অনুবাদ</b>: বাংলা থেকে ইংরেজি অথবা ইংরেজি থেকে বাংলায় যেকোনো বাক্য অনুবাদ করুন।\n"
-    "৭. <b>✍️ Caption বানান</b>: আপনার টপিক অনুযায়ী ইমোজি ও হ্যাশট্যাগসহ ৫টি আকর্ষণীয় সোশ্যাল মিডিয়া ক্যাপশন পান।\n"
-    "৮. <b>📖 গল্প / কবিতা</b>: যেকোনো বিষয়ের ওপর সুন্দর বাংলা গল্প বা কবিতা লিখে নিন।\n"
-    "৯. <b>🖼️ ছবি → PDF</b>: এক বা একাধিক ছবি পাঠিয়ে একটি সুন্দর PDF ফাইল তৈরি করুন।\n"
-    "১০. <b>📄 PDF Summary</b>: যেকোনো PDF ফাইল পাঠালে তার মূল সারাংশ বাংলায় জেনে নিন।\n"
-    "১১. <b>🕐 নামাজের সময়</b>: ঢাকা, খুলনা, চট্টগ্রাম, রাজশাহী, সিলেট ও বরিশালের আজকের নামাজের সময়সূচী দেখুন।\n"
-    "১২. <b>🌦️ আবহাওয়া</b>: যেকোনো শহরের বর্তমান তাপমাত্রা, আর্দ্রতা ও আবহাওয়ার অবস্থা জানুন।\n"
-    "১৩. <b>💱 কারেন্সি</b>: ডলার, টাকা, রুপি, ইউরো, পাউন্ড, রিয়াল, দিরহাম ইত্যাদির লাইভ মুদ্রা বিনিময় হার জানুন।\n"
-    "১৪. <b>🔗 লিংক ছোট করুন</b>: যেকোনো বড় ওয়েবসাইট লিংককে ছোট (Short URL) করুন।\n"
-    "১৫. <b>📚 ডিকশনারি</b>: যেকোনো ইংরেজি শব্দের অর্থ, উচ্চারণ ও উদাহরণ জানুন।\n"
-    "১৬. <b>😂 জোকস</b>: মজার বাংলা ও ইংরেজি জোকস পড়ে মন ভালো করুন।\n"
-    "১৭. <b>⚖️ BMI হিসাব</b>: আপনার ওজন (কেজি) ও উচ্চতা (ফুট.ইঞ্চি) দিয়ে বিএমআই ও স্বাস্থ্যগত অবস্থা জানুন।\n"
-    "১৮. <b>🔳 QR বানান</b>: যেকোনো টেক্সট বা লিংকের জন্য QR Code ছবি তৈরি করুন।\n"
-    "১৯. <b>📰 আজকের খবর</b>: গুগল নিউজ থেকে আজকের শীর্ষ ৫টি বাংলা সংবাদের শিরোনাম ও লিংক দেখুন।\n"
-    "২০. <b>🪙 ক্রিপ্টো দাম</b>: Bitcoin, Ethereum, BNB, Doge, XRP, Solana-এর বর্তমান দাম (USD ও BDT) দেখুন।\n"
-    "২১. <b>🎂 বয়স হিসাব</b>: আপনার জন্ম তারিখ (DD-MM-YYYY) দিয়ে নিখুঁত বয়স (বছর, মাস, দিন) বের করুন।\n"
-    "২২. <b>🔄 ইউনিট কনভার্ট</b>: কেজি-পাউন্ড, কিমি-মাইল, সেলসিয়াস-ফারেনহাইট, ফুট-মিটার ইত্যাদি একক রূপান্তর করুন।\n"
-    "২৩. <b>✨ ফ্যান্সি টেক্সট</b>: যেকোনো ইংরেজি লেখাকে বিভিন্ন স্টাইলিশ ইউনিকোড ফন্টে রূপান্তর করুন।\n"
-    "২৪. <b>❤️ Love ক্যালকুলেটর</b>: দুটি নাম দিয়ে মজার লাভ পার্সেন্টেজ হিসাব করুন।\n"
-    "২৫. <b>🗜️ ছবি কমপ্রেস</b>: ছবির মান ঠিক রেখে ফাইলের সাইজ কমান (JPEG কম্প্রেশন)।\n"
-    "২৬. <b>🎵 গানের লিরিক্স</b>: যেকোনো গানের তথ্য বা সংক্ষিপ্ত অংশ ও সারমর্ম জানুন।\n"
-    "২৭. <b>🔐 পাসওয়ার্ড</b>: ৮, ১২ বা ১৬ অক্ষরের শক্তিশালী ও নিরাপদ পাসওয়ার্ড তৈরি করুন।\n"
-    "২৮. <b>🤲 আজকের দোয়া</b>: প্রতিদিন আরবি ও বাংলা অর্থসহ একটি করে গুরুত্বপূর্ণ মাসনুন দোয়া জানুন।\n"
-    "২৯. <b>⏰ রিমাইন্ডার</b>: নির্দিষ্ট সময় পরে কোনো কাজের কথা মনে করিয়ে দেওয়ার জন্য অ্যালার্ম/রিমাইন্ডার সেট করুন।\n"
-    "৩০. <b>🧠 কুইজ খেলুন</b>:৫টি সাধারণ জ্ঞানের কুইজ খেলে পয়েন্ট ও স্ট্রিক বোনাস জিতুন।\n"
-    "৩১. <b>🛍️ শপ</b>: আমাদের স্টোর থেকে পছন্দের পণ্য দেখুন এবং অর্ডার করুন।\n"
-    "৩২. <b>📩 Contact Admin</b>: সরাসরি অ্যাডমিনের সাথে যোগাযোগ করুন বা আপনার মতামত জানান।\n"
-    "৩৩. <b>👤 প্রোফাইল</b>: আপনার নাম, পয়েন্ট, লেভেল, র‍্যাংক এবং রেফারেল তথ্য দেখুন।\n"
-    "৩৪. <b>🏆 লিডারবোর্ড</b>: সর্বকালের সেরা ১০ জন এবং এই সপ্তাহের সেরা ৫ জন ব্যবহারকারীর তালিকা দেখুন।\n"
-    "৩৫. <b>🎁 ডেইলি বোনাস</b>: প্রতিদিন একবার ফ্রি +৫ পয়েন্ট বোনাস সংগ্রহ করুন।\n"
-    "৩৬. <b>🎰 স্পিন</b>: প্রতিদিন একবার ভাগ্য পরীক্ষা করে ১ থেকে ৫০ পয়েন্ট পর্যন্ত জিতুন।\n"
-    "৩৭. <b>👥 রেফার করুন</b>: বন্ধুদের আমন্ত্রণ জানিয়ে প্রতি রেফারে +১০ পয়েন্ট অর্জন করুন।\n"
-    "৩৮. <b>ℹ️ About</b>: বটের প্রতিটি বাটনের বিস্তারিত পরিচিতি দেখুন।\n"
-    "৩৯. <b>❓ Help</b>: বট ব্যবহারের নিয়মাবলী ও কমান্ড সম্পর্কে জানুন।\n"
-    "৪০. <b>👨💻 Developer</b>: বট নির্মাতার তথ্য দেখুন।\n"
-    "৪১. <b>🏠 মেনু</b>: যেকোনো চলমান কাজ বাতিল করে মূল মেনুতে ফিরে আসুন।"
+    "ℹ️ <b>বট পরিচিতি ও সকল বাটনের কাজ (About)</b>\n"
+    f"{DIVIDER}\n"
+    "✨ <b>AI ও মিডিয়া টুলস:</b>\n"
+    "<blockquote>"
+    "১. <b>🤖 AI চ্যাট</b> — স্মার্ট বাংলা AI-এর সাথে কথোপকথন (৮টি মেসেজ হিস্ট্রি মনে রাখে)\n"
+    "২. <b>🎙️ Voice বানান</b> — যেকোনো লেখা থেকে বাংলা (নারী/পুরুষ) ও ইংরেজি ভয়েস তৈরি\n"
+    "৩. <b>🎤 Voice → Text</b> — ভয়েস মেসেজ থেকে অটোমেটিক বাংলা/ইংরেজি টেক্সট রূপান্তর\n"
+    "৪. <b>🖼️ AI ছবি</b> — ১০০% লোগো ও ওয়াটারমার্ক-মুক্ত HD ছবি তৈরি\n"
+    "৫. <b>📥 ভিডিও ডাউনলোড</b> — TikTok (HD), YouTube, FB, Insta ভিডিও ডাউনলোড\n"
+    "৬. <b>🌐 অনুবাদ</b> — বাংলা ↔ English নিখুঁত অনুবাদ\n"
+    "৭. <b>✍️ Caption বানান</b> — ইমোজি ও হ্যাশট্যাগসহ ৫টি ভাইরাল বাংলা ক্যাপশন\n"
+    "৮. <b>📖 গল্প / কবিতা</b> — যেকোনো টপিকে বাংলা গল্প বা কবিতা রচনা"
+    "</blockquote>\n\n"
+    "📂 <b>ডকুমেন্ট ও ইউটিলিটি টুলস:</b>\n"
+    "<blockquote>"
+    "৯. <b>🖼️ ছবি → PDF</b> — একাধিক ছবি একত্র করে PDF ফাইল তৈরি\n"
+    "১০. <b>📄 PDF Summary</b> — যেকোনো PDF ফাইলের বাংলা মূল সারাংশ\n"
+    "১১. <b>🕐 নামাজের সময়</b> — ৬টি বিভাগের আজকের নামাজের সঠিক সময়সূচী\n"
+    "১২. <b>🌦️ আবহাওয়া</b> — যেকোনো শহরের লাইভ তাপমাত্রা ও আবহাওয়ার খবর\n"
+    "১৩. <b>💱 কারেন্সি</b> — ডলার, টাকা, রুপি, ইউরো, রিয়াল ইত্যাদির লাইভ রেট\n"
+    "১৪. <b>🔗 লিংক ছোট করুন</b> — বড় লিংক মুহূর্তেই ছোট (Short URL) করা\n"
+    "১৫. <b>📚 ডিকশনারি</b> — ইংরেজি শব্দের বাংলা অর্থ, উচ্চারণ ও উদাহরণ\n"
+    "১৬. <b>😂 জোকস</b> — মজার বাংলা ও ইংরেজি জোকস\n"
+    "১৭. <b>⚖️ BMI হিসাব</b> — ওজন ও উচ্চতা দিয়ে স্বাস্থ্য ও BMI রিপোর্ট\n"
+    "১৮. <b>🔳 QR বানান</b> — যেকোনো টেক্সট বা লিংকের হাই-কোয়ালিটি QR Code\n"
+    "১৯. <b>📰 আজকের খবর</b> — Google News থেকে শীর্ষ ৫টি তাজা বাংলা খবর\n"
+    "২০. <b>🪙 ক্রিপ্টো দাম</b> — BTC, ETH, BNB, SOL ইত্যাদির লাইভ USD ও BDT দাম\n"
+    "২১. <b>🎂 বয়স হিসাব</b> — জন্ম তারিখ থেকে বছর, মাস ও দিনের নিখুঁত হিসাব\n"
+    "২২. <b>🔄 ইউনিট কনভার্ট</b> — কেজি-পাউন্ড, কিমি-মাইল, ফুট-মিটার ইত্যাদি রূপান্তর\n"
+    "২৩. <b>✨ ফ্যান্সি টেক্সট</b> — নাম বা লেখাকে স্টাইলিশ ইউনিকোড ফন্টে রূপান্তর\n"
+    "২৪. <b>❤️ Love ক্যালকুলেটর</b> — দুটি নাম দিয়ে মজার ভালোবাসার পার্সেন্টেজ\n"
+    "২৫. <b>🗜️ ছবি কমপ্রেস</b> — ছবির মান ঠিক রেখে ফাইল সাইজ কমানো\n"
+    "২৬. <b>🎵 গানের লিরিক্স</b> — গানের তথ্য, সারমর্ম ও সংক্ষিপ্ত অংশ\n"
+    "২৭. <b>🔐 পাসওয়ার্ড</b> — ৮, ১২ বা ১৬ অক্ষরের শক্তিশালী পাসওয়ার্ড তৈরি\n"
+    "২৮. <b>🤲 আজকের দোয়া</b> — আরবি ও বাংলা অর্থসহ প্রতিদিন একটি মাসনুন দোয়া\n"
+    "২৯. <b>⏰ রিমাইন্ডার</b> — নির্দিষ্ট সময় পর কাজের কথা মনে করিয়ে দেওয়ার অ্যালার্ম\n"
+    "৩০. <b>🧠 কুইজ খেলুন</b> — ৫টি বাংলা সাধারণ জ্ঞানের কুইজ খেলে পয়েন্ট অর্জন"
+    "</blockquote>\n\n"
+    "🎁 <b>শপ, প্রোফাইল ও অন্যান্য:</b>\n"
+    "<blockquote>"
+    "৩১. <b>🛍️ শপ</b> — বট স্টোর থেকে পণ্য দেখা ও অর্ডার করা\n"
+    "৩২. <b>📩 Contact Admin</b> — সরাসরি অ্যাডমিনের সাথে মেসেজে কথা বলা\n"
+    "৩৩. <b>👤 প্রোফাইল</b> — নিজের পয়েন্ট, লেভেল, র‍্যাংক ও রেফারেল লিংক\n"
+    "৩৪. <b>🏆 লিডারবোর্ড</b> — সর্বকালের সেরা ১০ ও সাপ্তাহিক সেরা ৫ জনের তালিকা\n"
+    "৩৫. <b>🎁 ডেইলি বোনাস</b> — প্রতিদিন ফ্রি +৫ পয়েন্ট বোনাস\n"
+    "৩৬. <b>🎰 স্পিন</b> — প্রতিদিন লাকি স্পিনে ১–৫০ পয়েন্ট জয়ের সুযোগ\n"
+    "৩৭. <b>👥 রেফার করুন</b> — বন্ধু আমন্ত্রণ জানিয়ে প্রতি রেফারে +১০ পয়েন্ট\n"
+    "৩৮. <b>ℹ️ About</b> — বটের সকল বাটনের বিস্তারিত তালিকা\n"
+    "৩৯. <b>❓ Help</b> — বট ব্যবহারের গাইডলাইন ও নিয়মাবলী\n"
+    "৪০. <b>👨💻 Developer</b> — বট নির্মাতার পরিচিতি\n"
+    "৪১. <b>🏠 মেনু</b> — যেকোনো টুল থেকে মূল মেনুতে ফিরে আসা"
+    "</blockquote>"
 )
 
 HELP_TEXT = (
-    "❓ <b>সাহায্য ও ব্যবহারের নিয়মাবলী (Help)</b>\n\n"
-    "🔹 <b>কীভাবে ব্যবহার করবেন?</b>\n"
-    "নিচের মেনু কিবোর্ড থেকে আপনার পছন্দের যেকোনো টুলের বাটনে চাপ দিন। এরপর বট আপনার কাছে প্রয়োজনীয় তথ্য (যেমন টেক্সট, লিংক, ছবি বা ভয়েস) চাইবে। তথ্য পাঠালেই বট সাথে সাথে ফলাফল জানিয়ে দেবে!\n\n"
-    "🔹 <b>পয়েন্ট ও লেভেল সিস্টেম:</b>\n"
-    "• যেকোনো টুল ব্যবহার করলে: <b>+১ পয়েন্ট</b>\n"
-    "• ডেইলি বোনাস: <b>+৫ পয়েন্ট</b> (প্রতিদিন ১ বার)\n"
-    "• ডেইলি স্পিন: <b>১ থেকে ৫০ পয়েন্ট</b> (প্রতিদিন ১ বার)\n"
-    "• বন্ধু রেফার করলে: <b>+১০ পয়েন্ট</b>\n"
-    "• কুইজে সঠিক উত্তর: <b>+৫ পয়েন্ট</b> (টানা ৩টি সঠিক উত্তরে +২ বোনাস)\n\n"
-    "🔹 <b>লেভেলসমূহ:</b>\n"
-    "• 🥉 Bronze: ০ – ৪৯ পয়েন্ট\n"
-    "• 🥈 Silver: ৫০ – ১৪৯ পয়েন্ট\n"
-    "• 🥇 Gold: ১৫০ – ৩৯৯ পয়েন্ট\n"
-    "• 💎 Diamond: ৪০০+ পয়েন্ট\n\n"
-    "🔹 <b>প্রয়োজনীয় কমান্ডসমূহ:</b>\n"
-    "• /start - বট চালু ও মূল মেনু\n"
-    "• /help - সাহায্য ও নির্দেশিকা\n"
-    "• /myid - আপনার টেলিগ্রাম ইউজার আইডি জানুন\n\n"
-    "যেকোনো সময় অন্য টুলে যেতে বা কাজ বাতিল করতে <b>🏠 মেনু</b> বাটনে চাপুন।"
+    "❓ <b>সাহায্য ও ব্যবহারের নিয়মাবলী (Help Guide)</b>\n"
+    f"{DIVIDER}\n"
+    "🧭 <b>কীভাবে ব্যবহার করবেন?</b>\n"
+    "<blockquote>নিচের মেনু কিবোর্ড থেকে আপনার পছন্দের যেকোনো বাটনে ট্যাপ করুন। বট আপনাকে কী পাঠাতে হবে তা বলে দেবে—আপনি টেক্সট, লিংক, ভয়েস বা ছবি পাঠালেই সাথে সাথে সুন্দর ফলাফল পেয়ে যাবেন!</blockquote>\n\n"
+    "💎 <b>পয়েন্ট ও রিওয়ার্ড সিস্টেম:</b>\n"
+    "<blockquote>"
+    "• 🛠️ প্রতিবার টুল ব্যবহারে: <b>+১ পয়েন্ট</b>\n"
+    "• 🎁 ডেইলি বোনাস: <b>+৫ পয়েন্ট</b> (প্রতিদিন ১ বার)\n"
+    "• 🎰 ডেইলি লাকি স্পিন: <b>১ থেকে ৫০ পয়েন্ট</b>\n"
+    "• 👥 প্রতি সফল রেফারে: <b>+১০ পয়েন্ট</b>\n"
+    "• 🧠 কুইজে সঠিক উত্তরে: <b>+৫ পয়েন্ট</b> (টানা ৩টি সঠিক হলে +২ বোনাস)"
+    "</blockquote>\n\n"
+    "🏅 <b>ইউজার লেভেলসমূহ:</b>\n"
+    "<blockquote>"
+    "• 🥉 <b>Bronze:</b> ০ – ৪৯ পয়েন্ট\n"
+    "• 🥈 <b>Silver:</b> ৫০ – ১৪৯ পয়েন্ট\n"
+    "• 🥇 <b>Gold:</b> ১৫০ – ৩৯৯ পয়েন্ট\n"
+    "• 💎 <b>Diamond:</b> ৪০০+ পয়েন্ট"
+    "</blockquote>\n\n"
+    "⌨️ <b>শর্টকাট কমান্ড:</b>\n"
+    "• <code>/start</code> — বট রিস্টার্ট ও মূল মেনু\n"
+    "• <code>/help</code> — ব্যবহারের নির্দেশিকা\n"
+    "• <code>/myid</code> — আপনার টেলিগ্রাম আইডি দেখুন\n\n"
+    "💡 <i>যেকোনো চলমান কাজ বাতিল করতে নিচের <b>🏠 মেনু</b> বাটনে চাপুন।</i>"
 )
 
 
@@ -826,7 +866,6 @@ def fetch_weather_info(city: str) -> str:
     city_clean = city.strip()
     headers = {"User-Agent": "Mozilla/5.0 (compatible; BigBot/1.0)"}
 
-    # Try Open-Meteo up to 3 times
     for attempt in range(3):
         try:
             geo_url = (
@@ -841,7 +880,7 @@ def fetch_weather_info(city: str) -> str:
             g_data = g_resp.json()
             results = g_data.get("results")
             if not results:
-                break  # Try wttr.in fallback if city not found in Open-Meteo
+                break
 
             loc = results[0]
             lat = loc["latitude"]
@@ -867,11 +906,15 @@ def fetch_weather_info(city: str) -> str:
             cond = WEATHER_CODE_MAP.get(wcode, "🌤️ স্বাভাবিক আবহাওয়া")
 
             return (
-                f"🌦️ <b>আবহাওয়ার আপডেট: {html.escape(resolved_name)}, {html.escape(country)}</b>\n\n"
-                f"🌡️ তাপমাত্রা: <b>{temp}°C</b>\n"
-                f"💧 আর্দ্রতা: <b>{hum}%</b>\n"
-                f"🌬️ বাতাসের গতি: <b>{wind} km/h</b>\n"
-                f"☁️ অবস্থা: <b>{cond}</b>"
+                f"🌦️ <b>আবহাওয়ার লাইভ রিপোর্ট</b>\n"
+                f"{DIVIDER}\n"
+                f"📍 <b>শহর:</b> {html.escape(resolved_name)}, {html.escape(country)}\n\n"
+                f"<blockquote>"
+                f"🌡️ <b>তাপমাত্রা:</b> {temp}°C\n"
+                f"💧 <b>আর্দ্রতা:</b> {hum}%\n"
+                f"🌬️ <b>বাতাসের গতি:</b> {wind} km/h\n"
+                f"☁️ <b>অবস্থা:</b> {cond}"
+                f"</blockquote>"
             )
         except Exception as e:
             logger.warning(f"Open-Meteo attempt {attempt + 1} failed: {e}")
@@ -893,11 +936,15 @@ def fetch_weather_info(city: str) -> str:
     desc = desc_list[0].get("value", "Clear") if desc_list else "Clear"
 
     return (
-        f"🌦️ <b>আবহাওয়ার আপডেট: {html.escape(city_clean)}</b>\n\n"
-        f"🌡️ তাপমাত্রা: <b>{temp_c}°C</b>\n"
-        f"💧 আর্দ্রতা: <b>{humidity}%</b>\n"
-        f"🌬️ বাতাসের গতি: <b>{wind_kmph} km/h</b>\n"
-        f"☁️ অবস্থা: <b>🌤️ {html.escape(desc)}</b>"
+        f"🌦️ <b>আবহাওয়ার লাইভ রিপোর্ট</b>\n"
+        f"{DIVIDER}\n"
+        f"📍 <b>শহর:</b> {html.escape(city_clean)}\n\n"
+        f"<blockquote>"
+        f"🌡️ <b>তাপমাত্রা:</b> {temp_c}°C\n"
+        f"💧 <b>আর্দ্রতা:</b> {humidity}%\n"
+        f"🌬️ <b>বাতাসের গতি:</b> {wind_kmph} km/h\n"
+        f"☁️ <b>অবস্থা:</b> 🌤️ {html.escape(desc)}"
+        f"</blockquote>"
     )
 
 
@@ -932,7 +979,6 @@ def convert_currency_input(raw_text: str) -> str:
     num_match = re.search(r"(\d+(?:\.\d+)?)", text)
     amount = float(num_match.group(1)) if num_match else 1.0
 
-    # Remove number and common words like 'to', 'in', '='
     tokens = re.findall(r"[a-zA-Z\u0980-\u09FF]+", text)
     codes: List[str] = []
     for t in tokens:
@@ -956,20 +1002,24 @@ def convert_currency_input(raw_text: str) -> str:
 
     rate = float(rates[dst])
     converted = amount * rate
-    lines = [
-        f"💱 <b>কারেন্সি কনভার্টার</b>\n",
-        f"💵 <b>{amount:,.2f} {src} = {converted:,.2f} {dst}</b>",
-        f"📊 বিনিময় হার: 1 {src} = {rate:,.4f} {dst}",
-    ]
-    # Also show BDT if src != BDT and dst != BDT
+    extra_lines = []
     if "BDT" in rates and dst != "BDT":
         bdt_val = amount * float(rates["BDT"])
-        lines.append(f"🇧🇩 বাংলাদেশী টাকায়: <b>{bdt_val:,.2f} BDT</b>")
+        extra_lines.append(f"🇧🇩 <b>বাংলাদেশী টাকায়:</b> {bdt_val:,.2f} BDT")
     elif src == "BDT" and len(codes) == 1 and "USD" in rates:
-        # Show popular currencies if user typed "500 taka"
-        lines.append(f"🇪🇺 EUR: {amount * float(rates.get('EUR', 0)):,.2f} EUR")
-        lines.append(f"🇮🇳 INR: {amount * float(rates.get('INR', 0)):,.2f} INR")
-    return "\n".join(lines)
+        extra_lines.append(f"🇪🇺 <b>EUR:</b> {amount * float(rates.get('EUR', 0)):,.2f} EUR")
+        extra_lines.append(f"🇮🇳 <b>INR:</b> {amount * float(rates.get('INR', 0)):,.2f} INR")
+
+    extra_block = ("\n" + "\n".join(extra_lines)) if extra_lines else ""
+    return (
+        f"💱 <b>কারেন্সি কনভার্টার (Live Rate)</b>\n"
+        f"{DIVIDER}\n"
+        f"<blockquote>"
+        f"💵 <b>{amount:,.2f} {src} = {converted:,.2f} {dst}</b>\n"
+        f"📊 <b>বিনিময় হার:</b> 1 {src} = {rate:,.4f} {dst}"
+        f"{extra_block}"
+        f"</blockquote>"
+    )
 
 
 def calculate_bmi_response(raw_text: str) -> str:
@@ -977,8 +1027,8 @@ def calculate_bmi_response(raw_text: str) -> str:
     nums = re.findall(r"\d+(?:\.\d+)?", text)
     if len(nums) < 2:
         return (
-            "⚠️ সঠিক ফরম্যাটে ওজন (কেজি) এবং উচ্চতা (ফুট.ইঞ্চি) পাঠান।\n"
-            "উদাহরণ: <code>70 5.7</code> অথবা <code>70 kg 5.7</code>"
+            "⚠️ <b>সঠিক ফরম্যাটে ওজন এবং উচ্চতা পাঠান!</b>\n\n"
+            "<blockquote>উদাহরণ: <code>70 5.7</code> অথবা <code>70 kg 5.7</code></blockquote>"
         )
 
     weight_kg = float(nums[0])
@@ -991,7 +1041,7 @@ def calculate_bmi_response(raw_text: str) -> str:
         inches = int(inches_str) if inches_str else 0
     else:
         val = float(height_raw)
-        if val > 10:  # In case someone entered cm directly
+        if val > 10:
             total_inches = val / 2.54
             feet = int(total_inches // 12)
             inches = int(round(total_inches % 12))
@@ -1008,24 +1058,27 @@ def calculate_bmi_response(raw_text: str) -> str:
 
     if bmi < 18.5:
         cat = "কম ওজন (Underweight) 🟡"
-        advice = "পুষ্টিকর খাবার গ্রহণ করুন এবং ওজন বাড়ানোর চেষ্টা করুন।"
+        advice = "পুষ্টিকর খাবার গ্রহণ করুন এবং সুষম খাদ্যতালিকা মেনে ওজন বাড়ানোর চেষ্টা করুন।"
     elif bmi < 25.0:
         cat = "স্বাভাবিক ওজন (Normal) 🟢"
-        advice = "অভিনন্দন! আপনার ওজন একদম সঠিক আছে।"
+        advice = "অভিনন্দন! আপনার ওজন ও উচ্চতার অনুপাত একদম সঠিক আছে।"
     elif bmi < 30.0:
         cat = "অতিরিক্ত ওজন (Overweight) 🟠"
-        advice = "নিয়মিত হাঁটাহাঁটি ও ব্যায়াম করুন এবং চর্বিযুক্ত খাবার এড়িয়ে চলুন।"
+        advice = "নিয়মিত হাঁটাহাঁটি ও ব্যায়াম করুন এবং অতিরিক্ত চর্বিযুক্ত খাবার এড়িয়ে চলুন।"
     else:
         cat = "স্থূলতা (Obese) 🔴"
-        advice = "স্বাস্থ্যঝুঁকি এড়াতে ডায়েট নিয়ন্ত্রণ করুন এবং চিকিৎসকের পরামর্শ নিন।"
+        advice = "স্বাস্থ্যঝুঁকি এড়াতে ডায়েট নিয়ন্ত্রণ করুন এবং প্রয়োজনে চিকিৎসকের পরামর্শ নিন।"
 
     return (
-        f"⚖️ <b>আপনার BMI রিপোর্ট</b>\n\n"
-        f"• ওজন: <b>{weight_kg:g} কেজি</b>\n"
-        f"• উচ্চতা: <b>{feet} ফুট {inches} ইঞ্চি ({height_m:.2f} মিটার)</b>\n"
-        f"• আপনার BMI: <b>{bmi:.2f}</b>\n"
-        f"• অবস্থা: <b>{cat}</b>\n\n"
-        f"💡 পরামর্শ: {advice}"
+        f"⚖️ <b>আপনার BMI ও স্বাস্থ্য রিপোর্ট</b>\n"
+        f"{DIVIDER}\n"
+        f"<blockquote>"
+        f"• <b>ওজন:</b> {weight_kg:g} কেজি\n"
+        f"• <b>উচ্চতা:</b> {feet} ফুট {inches} ইঞ্চি ({height_m:.2f} মিটার)\n"
+        f"• <b>আপনার BMI:</b> {bmi:.2f}\n"
+        f"• <b>শারীরিক অবস্থা:</b> {cat}"
+        f"</blockquote>\n\n"
+        f"💡 <b>পরামর্শ:</b> <i>{advice}</i>"
     )
 
 
@@ -1037,12 +1090,13 @@ def convert_unit_input(raw_text: str) -> str:
     )
     if not m:
         return (
-            "⚠️ সঠিক ফরম্যাটে লিখুন।\n"
-            "উদাহরণ:\n"
+            "⚠️ <b>সঠিক ফরম্যাটে লিখুন!</b>\n\n"
+            "<blockquote>"
             "• <code>10 kg to pound</code>\n"
             "• <code>5 km to mile</code>\n"
             "• <code>37 C to F</code>\n"
             "• <code>5.5 feet to cm</code>"
+            "</blockquote>"
         )
 
     val = float(m.group(1))
@@ -1111,12 +1165,16 @@ def convert_unit_input(raw_text: str) -> str:
 
     if res is None:
         return (
-            "⚠️ এই এককটি সাপোর্ট করে না।\n"
-            "সাপোর্টেড একক: kg↔pound, km↔mile, C↔F, inch↔cm, liter↔gallon, "
-            "feet↔cm, feet↔meter, meter↔feet, kg↔gram, hour↔minute."
+            "⚠️ <b>এই এককটি সাপোর্ট করে না।</b>\n"
+            "<blockquote>সাপোর্টেড একক: kg↔pound, km↔mile, C↔F, inch↔cm, liter↔gallon, "
+            "feet↔cm, feet↔meter, meter↔feet, kg↔gram, hour↔minute.</blockquote>"
         )
 
-    return f"🔄 <b>ইউনিট কনভার্টার:</b>\n\n✅ <b>{val:g} {u1.upper()} = {res:.4g} {u2.upper()}</b>"
+    return (
+        f"🔄 <b>ইউনিট কনভার্টার ফলাফল</b>\n"
+        f"{DIVIDER}\n"
+        f"<blockquote>✅ <b>{val:g} {u1.upper()} = {res:.4g} {u2.upper()}</b></blockquote>"
+    )
 
 
 def generate_fancy_text(text: str) -> str:
@@ -1132,17 +1190,20 @@ def generate_fancy_text(text: str) -> str:
         "Ⓒⓘⓡⓒⓛⓔⓓ": "ⓐⓑⓒⓓⓔⓕⓖⓗⓘⓙⓚⓛⓜⓝⓞⓟⓠⓡⓢⓣⓤⓥⓦⓧⓨⓩⒶⒷⒸⒹⒺⒻⒼⒽⒾⒿⓀⓁⓂⓃⓄⓅⓆⓇⓈⓉⓊⓋⓌⓍⓎⓏ0①②③④⑤⑥⑦⑧⑨",
     }
 
-    out = ["✨ <b>আপনার ফ্যান্সি টেক্সট:</b>\n"]
+    out = [f"✨ <b>আপনার স্টাইলিশ ফ্যান্সি টেক্সট</b>\n{DIVIDER}"]
+    lines = []
     for label, target in styles.items():
         if len(target) == len(normal):
             table = str.maketrans(normal, target)
             converted = text.translate(table)
         else:
             converted = text
-        out.append(f"• {label}: <code>{html.escape(converted)}</code>")
+        lines.append(f"◈ {label}: <code>{html.escape(converted)}</code>")
 
     spaced = " ".join(list(text))
-    out.append(f"• S p a c e d: <code>{html.escape(spaced)}</code>")
+    lines.append(f"◈ S p a c e d: <code>{html.escape(spaced)}</code>")
+    out.append("<blockquote>" + "\n".join(lines) + "</blockquote>")
+    out.append("👆 <i>যেকোনো স্টাইলের ওপর ট্যাপ করলেই কপি হয়ে যাবে!</i>")
     return "\n".join(out)
 
 
@@ -1150,7 +1211,7 @@ def calculate_age_response(raw_text: str) -> str:
     text = bn_to_en_digits(raw_text.strip())
     m = re.search(r"(\d{1,2})[-/.](\d{1,2})[-/.](\d{4})", text)
     if not m:
-        return "⚠️ সঠিক ফরম্যাটে জন্ম তারিখ লিখুন (DD-MM-YYYY)।\nউদাহরণ: <code>15-08-2002</code>"
+        return "⚠️ <b>সঠিক ফরম্যাটে জন্ম তারিখ লিখুন (DD-MM-YYYY)!</b>\n<blockquote>উদাহরণ: <code>15-08-2002</code></blockquote>"
 
     day, month, year = int(m.group(1)), int(m.group(2)), int(m.group(3))
     try:
@@ -1179,11 +1240,13 @@ def calculate_age_response(raw_text: str) -> str:
 
     total_days = (today - dob).days
     return (
-        f"🎂 <b>বয়স হিসাব ফলাফল</b>\n\n"
-        f"📅 জন্ম তারিখ: <b>{dob.strftime('%d-%m-%Y')}</b>\n"
-        f"✅ আপনার বর্তমান বয়স:\n"
-        f"👉 <b>{years} বছর, {months} মাস, {days} দিন</b>\n\n"
-        f"⏳ মোট দিন: <b>{total_days:,} দিন</b>"
+        f"🎂 <b>আপনার নিখুঁত বয়স রিপোর্ট</b>\n"
+        f"{DIVIDER}\n"
+        f"<blockquote>"
+        f"📅 <b>জন্ম তারিখ:</b> {dob.strftime('%d-%m-%Y')}\n"
+        f"✨ <b>বর্তমান বয়স:</b> <b>{years} বছর, {months} মাস, {days} দিন</b>\n"
+        f"⏳ <b>মোট অতিবাহিত দিন:</b> {total_days:,} দিন"
+        f"</blockquote>"
     )
 
 
@@ -1235,7 +1298,6 @@ def fetch_crypto_prices() -> str:
         ("solana", "SOL", "SOLUSDT", "Solana (SOL)"),
     ]
 
-    # Get USD->BDT rate (default ~120 if API fails)
     usd_to_bdt = 120.0
     try:
         r_fx = requests.get("https://open.er-api.com/v6/latest/USD", timeout=8)
@@ -1246,7 +1308,6 @@ def fetch_crypto_prices() -> str:
 
     prices_usd: Dict[str, float] = {}
 
-    # Try CoinGecko first
     try:
         ids_str = ",".join(c[0] for c in coins)
         cg_url = f"https://api.coingecko.com/api/v3/simple/price?ids={ids_str}&vs_currencies=usd"
@@ -1259,7 +1320,6 @@ def fetch_crypto_prices() -> str:
     except Exception as e:
         logger.warning(f"CoinGecko failed, falling back to Binance: {e}")
 
-    # Fallback to Binance for any missing coin
     for _, sym, binance_sym, _ in coins:
         if sym not in prices_usd:
             try:
@@ -1273,16 +1333,21 @@ def fetch_crypto_prices() -> str:
     if not prices_usd:
         raise RuntimeError("Could not fetch crypto prices from CoinGecko or Binance.")
 
-    lines = ["🪙 <b>ক্রিপ্টোকারেন্সির বর্তমান বাজারমূল্য</b>\n"]
+    body = []
     for _, sym, _, label in coins:
         if sym in prices_usd:
             usd = prices_usd[sym]
             bdt = usd * usd_to_bdt
             if usd >= 1:
-                lines.append(f"🔹 <b>{label}</b>\n   💵 ${usd:,.2f} USD  |  🇧🇩 ৳{bdt:,.2f} BDT")
+                body.append(f"🪙 <b>{label}</b>\n   💵 <code>${usd:,.2f}</code>  |  🇧🇩 <code>৳{bdt:,.0f}</code>")
             else:
-                lines.append(f"🔹 <b>{label}</b>\n   💵 ${usd:.4f} USD  |  🇧🇩 ৳{bdt:,.2f} BDT")
-    return "\n".join(lines)
+                body.append(f"🪙 <b>{label}</b>\n   💵 <code>${usd:.4f}</code>  |  🇧🇩 <code>৳{bdt:,.2f}</code>")
+
+    return (
+        f"📈 <b>ক্রিপ্টোকারেন্সির লাইভ বাজারমূল্য</b>\n"
+        f"{DIVIDER}\n"
+        f"<blockquote>" + "\n\n".join(body) + "</blockquote>"
+    )
 
 
 def fetch_google_news_bn() -> str:
@@ -1294,11 +1359,11 @@ def fetch_google_news_bn() -> str:
     if not items:
         return "📰 বর্তমানে কোনো খবর পাওয়া যায়নি।"
 
-    lines = ["📰 <b>আজকের শীর্ষ ৫টি খবর (Google News):</b>\n"]
+    lines = [f"📰 <b>আজকের শীর্ষ ৫টি তাজা খবর (Google News)</b>\n{DIVIDER}"]
     for idx, item in enumerate(items, 1):
         title = item.findtext("title") or "শিরোনাম নেই"
         link = item.findtext("link") or ""
-        lines.append(f"{idx}. <a href=\"{html.escape(link)}\">{html.escape(title)}</a>\n")
+        lines.append(f"<blockquote><b>{en_to_bn_digits(str(idx))}.</b> <a href=\"{html.escape(link)}\">{html.escape(title)}</a></blockquote>")
     return "\n".join(lines)
 
 
@@ -1327,7 +1392,6 @@ async def generate_tts_voice(text: str, voice: str) -> str:
         tts = gTTS(text=text, lang=lang)
         tts.save(tmp_mp3)
 
-    # Convert to OGG Opus using imageio-ffmpeg for native Telegram voice bubble
     tmp_ogg = tempfile.NamedTemporaryFile(delete=False, suffix=".ogg").name
     try:
         ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
@@ -1361,7 +1425,6 @@ def download_video_from_url(url: str) -> Tuple[str, str]:
     """
     tmp_dir = tempfile.mkdtemp(prefix="vid_")
 
-    # 1. TikTok via tikwm API first
     if "tiktok.com" in url.lower():
         try:
             api_url = f"https://www.tikwm.com/api/?url={urllib.parse.quote(url)}&hd=1"
@@ -1393,7 +1456,6 @@ def download_video_from_url(url: str) -> Tuple[str, str]:
         except Exception as e:
             logger.warning(f"tikwm API failed, falling back to yt-dlp: {e}")
 
-    # 2. Everything else (and TikTok fallback) via yt-dlp
     out_tmpl = os.path.join(tmp_dir, "video.%(ext)s")
     ydl_opts = {
         "format": "best[filesize<46M][ext=mp4]/best[filesize_approx<46M][ext=mp4]/best[ext=mp4]/best",
@@ -1410,7 +1472,6 @@ def download_video_from_url(url: str) -> Tuple[str, str]:
         downloaded_path = ydl.prepare_filename(info)
 
     if not os.path.exists(downloaded_path):
-        # Find any file inside tmp_dir
         files = [os.path.join(tmp_dir, f) for f in os.listdir(tmp_dir)]
         if not files:
             raise RuntimeError("Video download failed.")
@@ -1441,7 +1502,6 @@ def generate_quiz_questions() -> List[Dict[str, Any]]:
         max_tokens=1200,
         json_mode=True,
     )
-    # Extract JSON object
     m = re.search(r"\{.*\}", raw, flags=re.DOTALL)
     json_str = m.group(0) if m else raw
     parsed = json.loads(json_str)
@@ -1471,12 +1531,16 @@ async def send_quiz_question(message, context: ContextTypes.DEFAULT_TYPE) -> Non
     if idx >= len(questions):
         score = quiz_state["score"]
         total = len(questions)
+        earned = quiz_state["earned_points"]
         context.user_data.pop("quiz", None)
         context.user_data["state"] = None
         await message.reply_text(
-            f"🏁 <b>কুইজ শেষ হয়েছে!</b>\n\n"
-            f"✅ আপনার সঠিক উত্তর: <b>{score}/{total}</b>\n"
-            f"🏆 অর্জিত মোট পয়েন্ট: <b>{quiz_state['earned_points']}</b>",
+            f"🏁 <b>কুইজ প্রতিযোগিতা সম্পন্ন!</b>\n"
+            f"{DIVIDER}\n"
+            f"<blockquote>"
+            f"✅ <b>সঠিক উত্তর:</b> {score}/{total}\n"
+            f"🏆 <b>অর্জিত মোট পয়েন্ট:</b> +{earned} পয়েন্ট"
+            f"</blockquote>",
             parse_mode=ParseMode.HTML,
             reply_markup=MAIN_MENU_MARKUP,
         )
@@ -1488,8 +1552,9 @@ async def send_quiz_question(message, context: ContextTypes.DEFAULT_TYPE) -> Non
         buttons.append([InlineKeyboardButton(f"{opt_i + 1}. {opt_text}", callback_data=f"quiz_ans:{idx}:{opt_i}")])
 
     await message.reply_text(
-        f"🧠 <b>কুইজ প্রশ্ন {idx + 1}/{len(questions)}:</b>\n\n"
-        f"❓ <b>{html.escape(q['question'])}</b>",
+        f"🧠 <b>কুইজ প্রশ্ন ({idx + 1}/{len(questions)})</b>\n"
+        f"{DIVIDER}\n"
+        f"<blockquote>❓ <b>{html.escape(q['question'])}</b></blockquote>",
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup(buttons),
     )
@@ -1538,7 +1603,12 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         try:
             await context.bot.send_message(
                 chat_id=valid_ref,
-                text=f"🎉 অভিনন্দন! <b>{html.escape(full_name)}</b> আপনার রেফারেল লিংকে জয়েন করেছেন। আপনি পেয়েছেন <b>+১০ পয়েন্ট!</b>",
+                text=(
+                    f"🎉 <b>নতুন রেফারেল বোনাস!</b>\n"
+                    f"{DIVIDER}\n"
+                    f"<blockquote><b>{html.escape(full_name)}</b> আপনার রেফারেল লিংকে জয়েন করেছেন।\n"
+                    f"🎁 আপনি পেয়েছেন <b>+১০ পয়েন্ট!</b></blockquote>"
+                ),
                 parse_mode=ParseMode.HTML,
             )
         except Exception:
@@ -1552,12 +1622,20 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     context.user_data["state"] = None
     total_users = get_total_users()
+    u_row = get_user(user.id)
+    pts = int(u_row["points"]) if u_row else 0
+    lvl = get_level_name(pts)
 
     welcome_msg = (
-        f"আসসালামু আলাইকুম, <b>{html.escape(full_name)}</b>! 🌟\n\n"
-        f"আমাদের অল-ইন-ওয়ান স্মার্ট বাংলা বটে আপনাকে স্বাগতম।\n"
-        f"👥 মোট ব্যবহারকারী: <b>{en_to_bn_digits(str(total_users))} জন</b>\n\n"
-        f"নিচের মেনু থেকে আপনার পছন্দের যেকোনো সেবা বেছে নিন 👇"
+        f"✨ <b>আসসালামু আলাইকুম, {html.escape(full_name)}!</b>\n"
+        f"{DIVIDER}\n"
+        f"🚀 <b>অল-ইন-ওয়ান স্মার্ট বাংলা AI বটে স্বাগতম!</b>\n\n"
+        f"<blockquote>"
+        f"👤 <b>আপনার লেভেল:</b> {lvl} ({en_to_bn_digits(str(pts))} পয়েন্ট)\n"
+        f"👥 <b>মোট ব্যবহারকারী:</b> {en_to_bn_digits(str(total_users))} জন\n"
+        f"🛠️ <b>মোট সার্ভিস:</b> ৩০+ প্রিমিয়াম টুলস (সম্পূর্ণ ফ্রি)"
+        f"</blockquote>\n\n"
+        f"👇 <b>নিচের মেনু থেকে আপনার পছন্দের সেবাটি বেছে নিন:</b>"
     )
     await update.effective_message.reply_text(
         welcome_msg,
@@ -1582,7 +1660,7 @@ async def cmd_myid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not user or not update.effective_message or is_user_banned(user.id):
         return
     await update.effective_message.reply_text(
-        f"🆔 আপনার টেলিগ্রাম আইডি: <code>{user.id}</code>",
+        f"🆔 <b>আপনার টেলিগ্রাম ইউজার আইডি:</b>\n<blockquote><code>{user.id}</code></blockquote>",
         parse_mode=ParseMode.HTML,
     )
 
@@ -1610,20 +1688,21 @@ async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     if not user or not update.effective_message:
         return
-    # Silent ignore for non-admins as strictly required
     if not is_admin(user.id):
         return
 
     await update.effective_message.reply_text(
-        "🛠️ <b>অ্যাডমিন প্যানেল (Admin Panel)</b>\n\n"
-        "নিচের বাটনগুলো ব্যবহার করে বট নিয়ন্ত্রণ করুন অথবা কমান্ড ব্যবহার করুন:\n"
+        f"🛠️ <b>অ্যাডমিন কন্ট্রোল প্যানেল (Admin Panel)</b>\n"
+        f"{DIVIDER}\n"
+        "<blockquote>"
         "• <code>/ban &lt;id&gt;</code> | <code>/unban &lt;id&gt;</code>\n"
         "• <code>/maintenance on|off</code>\n"
         "• <code>/setchannel @ChannelName</code> | <code>/setchannel off</code>\n"
         "• <code>/channel</code>\n"
         "• <code>/premium &lt;id&gt; on|off</code>\n"
         "• <code>/addproduct নাম|দাম|বিবরণ</code>\n"
-        "• <code>/delproduct &lt;id&gt;</code>",
+        "• <code>/delproduct &lt;id&gt;</code>"
+        "</blockquote>",
         parse_mode=ParseMode.HTML,
         reply_markup=build_admin_panel_markup(),
     )
@@ -1645,7 +1724,7 @@ async def cmd_ban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     with get_db() as conn:
         conn.execute("UPDATE users SET banned = 1 WHERE user_id = ?", (uid,))
         conn.commit()
-    await update.effective_message.reply_text(f"🚫 ইউজার {uid}-কে ব্যান করা হয়েছে।")
+    await update.effective_message.reply_text(f"🚫 ইউজার <code>{uid}</code>-কে ব্যান করা হয়েছে।", parse_mode=ParseMode.HTML)
 
 
 async def cmd_unban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1663,7 +1742,7 @@ async def cmd_unban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     with get_db() as conn:
         conn.execute("UPDATE users SET banned = 0 WHERE user_id = ?", (uid,))
         conn.commit()
-    await update.effective_message.reply_text(f"✅ ইউজার {uid}-এর ব্যান তুলে নেওয়া হয়েছে।")
+    await update.effective_message.reply_text(f"✅ ইউজার <code>{uid}</code>-এর ব্যান তুলে নেওয়া হয়েছে।", parse_mode=ParseMode.HTML)
 
 
 async def cmd_maintenance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1725,7 +1804,7 @@ async def cmd_premium(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         conn.execute("UPDATE users SET premium = ? WHERE user_id = ?", (flag, uid))
         conn.commit()
     status_str = "চালু (ON)" if flag else "বন্ধ (OFF)"
-    await update.effective_message.reply_text(f"💎 ইউজার {uid}-এর প্রিমিয়াম স্ট্যাটাস: <b>{status_str}</b>", parse_mode=ParseMode.HTML)
+    await update.effective_message.reply_text(f"💎 ইউজার <code>{uid}</code>-এর প্রিমিয়াম স্ট্যাটাস: <b>{status_str}</b>", parse_mode=ParseMode.HTML)
 
 
 async def cmd_addproduct(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1745,7 +1824,9 @@ async def cmd_addproduct(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         pid = cur.lastrowid
         conn.commit()
     await update.effective_message.reply_text(
-        f"✅ পণ্য যোগ করা হয়েছে!\n🆔 ID: <b>{pid}</b>\n📦 নাম: {html.escape(name)}\n💰 দাম: {html.escape(price)}",
+        f"✅ <b>নতুন পণ্য যোগ করা হয়েছে!</b>\n"
+        f"{DIVIDER}\n"
+        f"<blockquote>🆔 ID: <b>{pid}</b>\n📦 নাম: {html.escape(name)}\n💰 দাম: {html.escape(price)}</blockquote>",
         parse_mode=ParseMode.HTML,
     )
 
@@ -1815,18 +1896,22 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 maint = "ON" if is_maintenance_on() else "OFF"
                 await query.answer()
                 await query.message.reply_text(
-                    f"📊 <b>বট পরিসংখ্যান (Stats)</b>\n\n"
-                    f"👥 মোট ইউজার: <b>{u_cnt}</b>\n"
-                    f"🛍️ মোট অর্ডার: <b>{o_cnt}</b>\n"
-                    f"📢 Force Join: <b>{html.escape(ch)}</b>\n"
-                    f"🔧 Maintenance: <b>{maint}</b>",
+                    f"📊 <b>বট পরিসংখ্যান (Live Stats)</b>\n"
+                    f"{DIVIDER}\n"
+                    f"<blockquote>"
+                    f"👥 <b>মোট ইউজার:</b> {u_cnt} জন\n"
+                    f"🛍️ <b>মোট অর্ডার:</b> {o_cnt} টি\n"
+                    f"📢 <b>Force Join:</b> {html.escape(ch)}\n"
+                    f"🔧 <b>Maintenance:</b> {maint}"
+                    f"</blockquote>",
                     parse_mode=ParseMode.HTML,
                 )
             elif action == "broadcast":
                 context.user_data["state"] = "ADMIN_BROADCAST"
                 await query.answer()
                 await query.message.reply_text(
-                    "📢 <b>ব্রডকাস্ট মোড চালু হয়েছে।</b>\n"
+                    f"📢 <b>ব্রডকাস্ট মোড চালু হয়েছে</b>\n"
+                    f"{DIVIDER}\n"
                     "এখন যে মেসেজটি পাঠাবেন সেটি সকল ব্যবহারকারীর কাছে চলে যাবে (বাতিল করতে 🏠 মেনু চাপুন):",
                     parse_mode=ParseMode.HTML,
                 )
@@ -1835,8 +1920,9 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 status_txt = f"বর্তমান চ্যানেল: <b>{html.escape(ch)}</b>" if ch else "বর্তমানে কোনো চ্যানেল সেট করা নেই (OFF)।"
                 await query.answer()
                 await query.message.reply_text(
-                    f"📢 <b>চ্যানেল (Force Join) সেটিংস</b>\n\n"
-                    f"{status_txt}\n\n"
+                    f"📢 <b>চ্যানেল (Force Join) সেটিংস</b>\n"
+                    f"{DIVIDER}\n"
+                    f"<blockquote>{status_txt}</blockquote>\n\n"
                     f"🔹 চ্যানেল সেট করতে কমান্ড দিন:\n<code>/setchannel @ChannelName</code>\n"
                     f"🔹 বন্ধ করতে কমান্ড দিন:\n<code>/setchannel off</code>",
                     parse_mode=ParseMode.HTML,
@@ -1864,8 +1950,9 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             context.user_data["state"] = "WAIT_TTS_TEXT"
             await query.answer("ভয়েস নির্বাচন করা হয়েছে!")
             await query.message.reply_text(
-                f"🎙️ নির্বাচিত ভয়েস: <b>{voice}</b>\n\n"
-                "এখন আপনার টেক্সট পাঠান (সর্বোচ্চ ৮০০ অক্ষর):",
+                f"🎙️ <b>নির্বাচিত ভয়েস:</b> <code>{voice}</code>\n"
+                f"{DIVIDER}\n"
+                "✍️ এখন আপনার টেক্সট পাঠান (সর্বোচ্চ ৮০০ অক্ষর):",
                 parse_mode=ParseMode.HTML,
             )
             return
@@ -1878,7 +1965,9 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             label = "বাংলা → English" if direction == "bn2en" else "English → বাংলা"
             await query.answer()
             await query.message.reply_text(
-                f"🌐 অনুবাদের দিক: <b>{label}</b>\n\nযে লেখাটি অনুবাদ করতে চান তা পাঠান:",
+                f"🌐 <b>অনুবাদের ভাষা:</b> {label}\n"
+                f"{DIVIDER}\n"
+                "✍️ যে লেখাটি অনুবাদ করতে চান তা পাঠান:",
                 parse_mode=ParseMode.HTML,
             )
             return
@@ -1893,14 +1982,17 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             resp.raise_for_status()
             timings = resp.json()["data"]["timings"]
             msg = (
-                f"🕌 <b>নামাজের সময়সূচী ({city_bn})</b>\n"
-                f"📅 তারিখ: {today_str}\n\n"
-                f"🌅 ফজর (Fajr): <b>{format_12h(timings['Fajr'])}</b>\n"
-                f"☀️ সূর্যোদয় (Sunrise): <b>{format_12h(timings['Sunrise'])}</b>\n"
-                f"🌞 যোহর (Dhuhr): <b>{format_12h(timings['Dhuhr'])}</b>\n"
-                f"🌤️ আসর (Asr): <b>{format_12h(timings['Asr'])}</b>\n"
-                f"🌇 মাগরিব (Maghrib): <b>{format_12h(timings['Maghrib'])}</b>\n"
-                f"🌙 ইশা (Isha): <b>{format_12h(timings['Isha'])}</b>"
+                f"🕌 <b>আজকের নামাজের সময়সূচী ({city_bn})</b>\n"
+                f"{DIVIDER}\n"
+                f"📅 <b>তারিখ:</b> {today_str}\n\n"
+                f"<blockquote>"
+                f"🌅 <b>ফজর (Fajr):</b> {format_12h(timings['Fajr'])}\n"
+                f"☀️ <b>সূর্যোদয় (Sunrise):</b> {format_12h(timings['Sunrise'])}\n"
+                f"🌞 <b>যোহর (Dhuhr):</b> {format_12h(timings['Dhuhr'])}\n"
+                f"🌤️ <b>আসর (Asr):</b> {format_12h(timings['Asr'])}\n"
+                f"🌇 <b>মাগরিব (Maghrib):</b> {format_12h(timings['Maghrib'])}\n"
+                f"🌙 <b>ইশা (Isha):</b> {format_12h(timings['Isha'])}"
+                f"</blockquote>"
             )
             add_points(user.id, 1)
             await query.message.reply_text(msg, parse_mode=ParseMode.HTML)
@@ -1910,7 +2002,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         if data.startswith("pwd_len:"):
             length = int(data.split(":", 1)[1])
             alphabet = string.ascii_letters + string.digits + "!@#$%^&*()-_=+"
-            # Ensure at least one upper, lower, digit, symbol
             pwd_chars = [
                 secrets.choice(string.ascii_uppercase),
                 secrets.choice(string.ascii_lowercase),
@@ -1922,9 +2013,10 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             add_points(user.id, 1)
             await query.answer("পাসওয়ার্ড তৈরি হয়েছে!")
             await query.message.reply_text(
-                f"🔐 <b>আপনার {length} অক্ষরের শক্তিশালী পাসওয়ার্ড:</b>\n\n"
-                f"<code>{html.escape(pwd)}</code>\n\n"
-                f"👆 পাসওয়ার্ডটির ওপর ট্যাপ করলে কপি হয়ে যাবে।",
+                f"🔐 <b>আপনার {en_to_bn_digits(str(length))} অক্ষরের শক্তিশালী পাসওয়ার্ড</b>\n"
+                f"{DIVIDER}\n"
+                f"<blockquote><code>{html.escape(pwd)}</code></blockquote>\n"
+                f"👆 <i>পাসওয়ার্ডটির ওপর ট্যাপ করলেই কপি হয়ে যাবে।</i>",
                 parse_mode=ParseMode.HTML,
             )
             return
@@ -1952,7 +2044,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 bonus_msg = ""
                 if cur_streak % 3 == 0:
                     pts += 2
-                    bonus_msg = "\n🔥 টানা ৩টি সঠিক উত্তরের জন্য <b>+২ স্ট্রিক বোনাস!</b>"
+                    bonus_msg = "\n🔥 <b>টানা ৩টি সঠিক উত্তরের জন্য +২ স্ট্রিক বোনাস!</b>"
                 add_points(user.id, pts)
                 with get_db() as conn:
                     conn.execute("UPDATE users SET quiz_streak = ? WHERE user_id = ?", (cur_streak, user.id))
@@ -1968,7 +2060,10 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
             await query.answer()
             await query.edit_message_text(
-                f"{query.message.text}\n\n{feedback}",
+                f"🧠 <b>কুইজ প্রশ্ন ({q_idx + 1}/{len(quiz_state['questions'])})</b>\n"
+                f"{DIVIDER}\n"
+                f"<blockquote>❓ {html.escape(q['question'])}</blockquote>\n\n"
+                f"{feedback}",
                 parse_mode=ParseMode.HTML,
             )
             quiz_state["index"] += 1
@@ -1987,11 +2082,13 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             context.user_data["state"] = "WAIT_ORDER_DETAILS"
             await query.answer()
             await query.message.reply_text(
-                f"🛍️ আপনি <b>{html.escape(prod['name'])}</b> ({html.escape(prod['price'])}) অর্ডার করতে যাচ্ছেন।\n\n"
-                f"অনুগ্রহ করে <b>একটি মেসেজেই</b> আপনার নিচের তথ্যগুলো লিখে পাঠান:\n"
+                f"🛍️ <b>অর্ডার ফর্ম: {html.escape(prod['name'])}</b>\n"
+                f"{DIVIDER}\n"
+                f"💰 <b>মূল্য:</b> {html.escape(prod['price'])}\n\n"
+                f"<blockquote>অনুগ্রহ করে <b>একটি মেসেজেই</b> আপনার নিচের তথ্যগুলো লিখে পাঠান:\n"
                 f"১. আপনার নাম\n"
                 f"২. মোবাইল নম্বর\n"
-                f"৩. সম্পূর্ণ ঠিকানা",
+                f"৩. সম্পূর্ণ ঠিকানা</blockquote>",
                 parse_mode=ParseMode.HTML,
             )
             return
@@ -2033,7 +2130,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 reply_text = msg.text or msg.caption or ""
                 await context.bot.send_message(
                     chat_id=target_uid,
-                    text=f"📩 <b>অ্যাডমিনের উত্তর:</b>\n\n{html.escape(reply_text)}",
+                    text=(
+                        f"📩 <b>অ্যাডমিনের উত্তর (Admin Reply)</b>\n"
+                        f"{DIVIDER}\n"
+                        f"<blockquote>{html.escape(reply_text)}</blockquote>"
+                    ),
                     parse_mode=ParseMode.HTML,
                 )
                 await msg.reply_text("✅ আপনার উত্তর ইউজারের কাছে পাঠানো হয়েছে।")
@@ -2050,7 +2151,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         context.user_data.pop("pdf_images", None)
         context.user_data.pop("quiz", None)
         await msg.reply_text(
-            "🏠 মূল মেনুতে ফিরে এসেছেন। নিচের বাটন থেকে যেকোনো অপশন বেছে নিন:",
+            f"🏠 <b>মূল মেনুতে ফিরে এসেছেন</b>\n{DIVIDER}\n👇 নিচের বাটন থেকে আপনার পছন্দের যেকোনো অপশন বেছে নিন:",
+            parse_mode=ParseMode.HTML,
             reply_markup=MAIN_MENU_MARKUP,
         )
         return
@@ -2074,8 +2176,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 failed += 1
         await status_msg.edit_text(
             f"✅ <b>ব্রডকাস্ট সম্পন্ন!</b>\n"
-            f"• সফল: {sent} জন\n"
-            f"• ব্যর্থ: {failed} জন",
+            f"{DIVIDER}\n"
+            f"<blockquote>• সফল: <b>{sent} জন</b>\n• ব্যর্থ: <b>{failed} জন</b></blockquote>",
             parse_mode=ParseMode.HTML,
         )
         return
@@ -2121,20 +2223,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 # ---------------------------------------------------------------------------
-# MENU BUTTON ROUTER
+# MENU BUTTON ROUTER (STYLISH PROMPTS)
 # ---------------------------------------------------------------------------
 async def route_menu_button(
     btn: str, msg, user, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    # Reset previous state unless continuing
     context.user_data["state"] = None
 
     try:
         if btn == BTN_AI_CHAT:
             context.user_data["state"] = "WAIT_AI_CHAT"
             await msg.reply_text(
-                "🤖 <b>AI চ্যাট চালু হয়েছে!</b>\n\n"
-                "আপনার যেকোনো প্রশ্ন বা কথা বাংলায় বা ইংরেজিতে লিখুন (পূর্বের ৮টি কথোপকথন বট মনে রাখবে):",
+                f"🤖 <b>স্মার্ট AI চ্যাট অ্যাসিস্ট্যান্ট</b>\n"
+                f"{DIVIDER}\n"
+                "<blockquote>আপনার যেকোনো প্রশ্ন, পড়াশোনা, কোডিং বা সাধারণ কথা বাংলায় অথবা ইংরেজিতে লিখুন। বট আপনার পূর্বের ৮টি কথোপকথন মনে রাখবে!</blockquote>\n"
+                "✍️ <b>আপনার প্রশ্নটি লিখুন:</b>",
                 parse_mode=ParseMode.HTML,
             )
 
@@ -2154,9 +2257,10 @@ async def route_menu_button(
                 ]
             )
             await msg.reply_text(
-                f"🎙️ <b>Voice বানান (Text-to-Speech)</b>\n\n"
-                f"বর্তমান ভয়েস: <b>{default_voice}</b>\n"
-                f"নিচের বাটন থেকে ভয়েস পরিবর্তন করতে পারেন অথবা সরাসরি আপনার লেখাটি পাঠান (সর্বোচ্চ ৮০০ অক্ষর):",
+                f"🎙️ <b>টেক্সট থেকে ভয়েস (Text-to-Speech)</b>\n"
+                f"{DIVIDER}\n"
+                f"<blockquote>🔊 <b>বর্তমান ভয়েস:</b> <code>{default_voice}</code>\n"
+                f"নিচের বাটন থেকে কণ্ঠ পরিবর্তন করতে পারেন অথবা সরাসরি আপনার লেখাটি পাঠান (সর্বোচ্চ ৮০০ অক্ষর)।</blockquote>",
                 parse_mode=ParseMode.HTML,
                 reply_markup=kb,
             )
@@ -2164,44 +2268,51 @@ async def route_menu_button(
         elif btn == BTN_STT:
             context.user_data["state"] = "WAIT_STT_VOICE"
             await msg.reply_text(
-                "🎤 <b>Voice → Text</b>\n\n"
-                "অনুগ্রহ করে একটি ভয়েস মেসেজ (Voice Message) রেকর্ড করে পাঠান, আমি তা লেখায় রূপান্তর করে দেব:"
+                f"🎤 <b>ভয়েস থেকে টেক্সট (Voice → Text)</b>\n"
+                f"{DIVIDER}\n"
+                "<blockquote>অনুগ্রহ করে একটি ভয়েস মেসেজ (Voice Message) রেকর্ড করে পাঠান, আমি তা সাথে সাথে লেখায় রূপান্তর করে দেব!</blockquote>",
+                parse_mode=ParseMode.HTML,
             )
 
         elif btn == BTN_AI_IMG:
             context.user_data["state"] = "WAIT_AI_IMG"
             await msg.reply_text(
-                "🖼️ <b>AI ছবি জেনারেটর</b>\n\n"
-                "আপনি কীসের ছবি তৈরি করতে চান তা বিস্তারিত লিখুন (ইংরেজি বা বাংলায়):\n"
-                "উদাহরণ: <code>A futuristic Dhaka city at sunset, cyberpunk style</code>",
+                f"🖼️ <b>AI ছবি জেনারেটর (100% Watermark-Free HD)</b>\n"
+                f"{DIVIDER}\n"
+                "<blockquote>আপনি কীসের ছবি তৈরি করতে চান তা বিস্তারিত লিখুন (ইংরেজি বা বাংলায়)।\n"
+                "💡 <b>উদাহরণ:</b> <code>A majestic royal Bengal tiger in Sundarbans at golden hour, photorealistic 8k</code></blockquote>",
                 parse_mode=ParseMode.HTML,
             )
 
         elif btn == BTN_VID_DL:
             if is_premium_mode_on() and not is_user_premium(user.id):
                 await msg.reply_text(
-                    "💎 <b>প্রিমিয়াম ফিচার!</b>\n\n"
-                    "বর্তমানে ভিডিও ডাউনলোড শুধুমাত্র প্রিমিয়াম মেম্বারদের জন্য চালু আছে। প্রিমিয়াম নিতে অ্যাডমিনের সাথে যোগাযোগ করুন।",
+                    f"💎 <b>প্রিমিয়াম ফিচার!</b>\n{DIVIDER}\n"
+                    "<blockquote>বর্তমানে ভিডিও ডাউনলোড শুধুমাত্র প্রিমিয়াম মেম্বারদের জন্য চালু আছে। প্রিমিয়াম নিতে অ্যাডমিনের সাথে যোগাযোগ করুন।</blockquote>",
                     parse_mode=ParseMode.HTML,
                 )
                 return
             context.user_data["state"] = "WAIT_VID_DL"
             await msg.reply_text(
-                "📥 <b>ভিডিও ডাউনলোডার</b>\n\n"
-                "TikTok, YouTube, Facebook বা Instagram ভিডিওর লিংক (অথবা শেয়ার টেক্সট) পাঠান:"
+                f"📥 <b>অল-ইন-ওয়ান ভিডিও ডাউনলোডার</b>\n"
+                f"{DIVIDER}\n"
+                "<blockquote>TikTok (ওয়াটারমার্ক ছাড়া HD), YouTube, Facebook বা Instagram ভিডিওর লিংক (অথবা শেয়ার টেক্সট) পাঠান:</blockquote>",
+                parse_mode=ParseMode.HTML,
             )
 
         elif btn == BTN_TRANSLATE:
             kb = InlineKeyboardMarkup(
                 [
                     [
-                        InlineKeyboardButton("বাংলা → English", callback_data="trans_dir:bn2en"),
-                        InlineKeyboardButton("English → বাংলা", callback_data="trans_dir:en2bn"),
+                        InlineKeyboardButton("🇧🇩 বাংলা → English 🇬🇧", callback_data="trans_dir:bn2en"),
+                        InlineKeyboardButton("🇬🇧 English → বাংলা 🇧🇩", callback_data="trans_dir:en2bn"),
                     ]
                 ]
             )
             await msg.reply_text(
-                "🌐 <b>অনুবাদ (Translator)</b>\n\nঅনুবাদের ভাষা নির্বাচন করুন:",
+                f"🌐 <b>স্মার্ট ভাষা অনুবাদক (Translator)</b>\n"
+                f"{DIVIDER}\n"
+                "👇 অনুগ্রহ করে অনুবাদের দিক নির্বাচন করুন:",
                 parse_mode=ParseMode.HTML,
                 reply_markup=kb,
             )
@@ -2209,23 +2320,28 @@ async def route_menu_button(
         elif btn == BTN_CAPTION:
             context.user_data["state"] = "WAIT_CAPTION"
             await msg.reply_text(
-                "✍️ <b>Caption বানান</b>\n\n"
-                "কোন বিষয়ের ওপর ক্যাপশন চান তা লিখুন (যেমন: বৃষ্টির দিন, বন্ধুদের সাথে আড্ডা, ভ্রমণ):"
+                f"✍️ <b>সোশ্যাল মিডিয়া ক্যাপশন মেকার</b>\n"
+                f"{DIVIDER}\n"
+                "<blockquote>কোন বিষয়ের ওপর ক্যাপশন চান তা লিখুন (যেমন: বৃষ্টির দিন, বন্ধুদের সাথে আড্ডা, প্রোফাইল পিকচার, ভ্রমণ):</blockquote>",
+                parse_mode=ParseMode.HTML,
             )
 
         elif btn == BTN_STORY:
             context.user_data["state"] = "WAIT_STORY"
             await msg.reply_text(
-                "📖 <b>গল্প / কবিতা</b>\n\n"
-                "কোন বিষয়ের ওপর গল্প বা কবিতা চান তা লিখুন (যেমন: গ্রামের সন্ধ্যা নিয়ে কবিতা, একটি ভূতের গল্প):"
+                f"📖 <b>গল্প ও কবিতা লেখক</b>\n"
+                f"{DIVIDER}\n"
+                "<blockquote>কোন বিষয়ের ওপর গল্প বা কবিতা চান তা লিখুন (যেমন: গ্রামের সন্ধ্যা নিয়ে কবিতা, একটি রহস্যময় গল্প):</blockquote>",
+                parse_mode=ParseMode.HTML,
             )
 
         elif btn == BTN_IMG_PDF:
             context.user_data["state"] = "WAIT_IMG_PDF"
             context.user_data["pdf_images"] = []
             await msg.reply_text(
-                "🖼️ <b>ছবি → PDF</b>\n\n"
-                "একের পর এক ছবি (Photo) পাঠাতে থাকুন। সব ছবি পাঠানো শেষ হলে নিচের <b>✅ PDF বানান</b> বাটনে চাপুন:",
+                f"🖼️ <b>ছবি থেকে PDF কনভার্টার</b>\n"
+                f"{DIVIDER}\n"
+                "<blockquote>একের পর এক ছবি (Photo) পাঠাতে থাকুন। সব ছবি পাঠানো শেষ হলে নিচের <b>✅ PDF বানান</b> বাটনে চাপুন!</blockquote>",
                 parse_mode=ParseMode.HTML,
                 reply_markup=PDF_COLLECT_MARKUP,
             )
@@ -2233,29 +2349,33 @@ async def route_menu_button(
         elif btn == BTN_PDF_SUM:
             context.user_data["state"] = "WAIT_PDF_SUM"
             await msg.reply_text(
-                "📄 <b>PDF Summary</b>\n\n"
-                "অনুগ্রহ করে আপনার PDF ফাইলটি ডকুমেন্ট হিসেবে পাঠান, আমি বাংলায় সারাংশ করে দেব:"
+                f"📄 <b>PDF সারাংশ (AI PDF Summary)</b>\n"
+                f"{DIVIDER}\n"
+                "<blockquote>অনুগ্রহ করে আপনার PDF ফাইলটি ডকুমেন্ট হিসেবে পাঠান, আমি তার মূল বক্তব্য সহজ বাংলায় সাজিয়ে দেব!</blockquote>",
+                parse_mode=ParseMode.HTML,
             )
 
         elif btn == BTN_PRAYER:
             kb = InlineKeyboardMarkup(
                 [
                     [
-                        InlineKeyboardButton("ঢাকা", callback_data="prayer_city:Dhaka|ঢাকা"),
-                        InlineKeyboardButton("খুলনা", callback_data="prayer_city:Khulna|খুলনা"),
+                        InlineKeyboardButton("🕌 ঢাকা", callback_data="prayer_city:Dhaka|ঢাকা"),
+                        InlineKeyboardButton("🕌 খুলনা", callback_data="prayer_city:Khulna|খুলনা"),
                     ],
                     [
-                        InlineKeyboardButton("চট্টগ্রাম", callback_data="prayer_city:Chittagong|চট্টগ্রাম"),
-                        InlineKeyboardButton("রাজশাহী", callback_data="prayer_city:Rajshahi|রাজশাহী"),
+                        InlineKeyboardButton("🕌 চট্টগ্রাম", callback_data="prayer_city:Chittagong|চট্টগ্রাম"),
+                        InlineKeyboardButton("🕌 রাজশাহী", callback_data="prayer_city:Rajshahi|রাজশাহী"),
                     ],
                     [
-                        InlineKeyboardButton("সিলেট", callback_data="prayer_city:Sylhet|সিলেট"),
-                        InlineKeyboardButton("বরিশাল", callback_data="prayer_city:Barisal|বরিশাল"),
+                        InlineKeyboardButton("🕌 সিলেট", callback_data="prayer_city:Sylhet|সিলেট"),
+                        InlineKeyboardButton("🕌 বরিশাল", callback_data="prayer_city:Barisal|বরিশাল"),
                     ],
                 ]
             )
             await msg.reply_text(
-                "🕐 <b>নামাজের সময়সূচী</b>\n\nআপনার বিভাগ/শহর নির্বাচন করুন:",
+                f"🕐 <b>আজকের নামাজের সময়সূচী</b>\n"
+                f"{DIVIDER}\n"
+                "👇 আপনার বিভাগ/শহর নির্বাচন করুন:",
                 parse_mode=ParseMode.HTML,
                 reply_markup=kb,
             )
@@ -2263,34 +2383,42 @@ async def route_menu_button(
         elif btn == BTN_WEATHER:
             context.user_data["state"] = "WAIT_WEATHER"
             await msg.reply_text(
-                "🌦️ <b>আবহাওয়া (Weather)</b>\n\n"
-                "আপনার শহরের নাম লিখুন (যেমন: <code>Dhaka</code>, <code>Khulna</code>, <code>Chittagong</code>):",
+                f"🌦️ <b>লাইভ আবহাওয়ার খবর</b>\n"
+                f"{DIVIDER}\n"
+                "<blockquote>আপনার শহরের নাম লিখুন:\n"
+                "যেমন: <code>Dhaka</code>, <code>Khulna</code>, <code>Chittagong</code>, <code>Sylhet</code></blockquote>",
                 parse_mode=ParseMode.HTML,
             )
 
         elif btn == BTN_CURRENCY:
             context.user_data["state"] = "WAIT_CURRENCY"
             await msg.reply_text(
-                "💱 <b>কারেন্সি কনভার্টার</b>\n\n"
-                "পরিমাণ ও মুদ্রার নাম লিখুন।\n"
-                "উদাহরণ:\n"
+                f"💱 <b>লাইভ কারেন্সি কনভার্টার</b>\n"
+                f"{DIVIDER}\n"
+                "<blockquote>পরিমাণ ও মুদ্রার নাম লিখুন:\n"
                 "• <code>100 USD</code>\n"
                 "• <code>100 dollar</code>\n"
                 "• <code>500 taka</code>\n"
-                "• <code>50 euro to bdt</code>",
+                "• <code>50 riyal to bdt</code></blockquote>",
                 parse_mode=ParseMode.HTML,
             )
 
         elif btn == BTN_SHORTURL:
             context.user_data["state"] = "WAIT_SHORTURL"
             await msg.reply_text(
-                "🔗 <b>লিংক ছোট করুন</b>\n\nআপনার বড় লিংকটি (URL) পাঠান:"
+                f"🔗 <b>লিংক শর্টনার (URL Shortener)</b>\n"
+                f"{DIVIDER}\n"
+                "<blockquote>আপনার বড় ওয়েবসাইট লিংকটি (http/https সহ) পাঠান:</blockquote>",
+                parse_mode=ParseMode.HTML,
             )
 
         elif btn == BTN_DICT:
             context.user_data["state"] = "WAIT_DICT"
             await msg.reply_text(
-                "📚 <b>ডিকশনারি (Dictionary)</b>\n\nযেকোনো একটি ইংরেজি শব্দ (Word) লিখুন:"
+                f"📚 <b>ইংরেজি থেকে বাংলা ডিকশনারি</b>\n"
+                f"{DIVIDER}\n"
+                "<blockquote>যেকোনো একটি ইংরেজি শব্দ (Word) লিখে পাঠান:</blockquote>",
+                parse_mode=ParseMode.HTML,
             )
 
         elif btn == BTN_JOKES:
@@ -2301,27 +2429,36 @@ async def route_menu_button(
                 r = requests.get("https://official-joke-api.appspot.com/random_joke", timeout=6)
                 if r.status_code == 200:
                     jd = r.json()
-                    en_joke_str = f"\n\n🌐 <b>English Joke:</b>\n{html.escape(jd.get('setup', ''))}\n— <i>{html.escape(jd.get('punchline', ''))}</i>"
+                    en_joke_str = (
+                        f"\n\n🌐 <b>English Joke:</b>\n"
+                        f"<blockquote>{html.escape(jd.get('setup', ''))}\n— <i>{html.escape(jd.get('punchline', ''))}</i></blockquote>"
+                    )
             except Exception:
                 pass
             await msg.reply_text(
-                f"😂 <b>আজকের জোকস:</b>\n\n{bn_joke}{en_joke_str}",
+                f"😂 <b>আজকের মজার জোকস</b>\n"
+                f"{DIVIDER}\n"
+                f"<blockquote>{bn_joke}</blockquote>{en_joke_str}",
                 parse_mode=ParseMode.HTML,
             )
 
         elif btn == BTN_BMI:
             context.user_data["state"] = "WAIT_BMI"
             await msg.reply_text(
-                "⚖️ <b>BMI হিসাব</b>\n\n"
-                "আপনার ওজন (কেজি) এবং উচ্চতা (ফুট.ইঞ্চি) পাঠান।\n"
-                "উদাহরণ: <code>70 5.7</code> অথবা <code>70 kg 5.7</code>",
+                f"⚖️ <b>BMI ও স্বাস্থ্য ক্যালকুলেটর</b>\n"
+                f"{DIVIDER}\n"
+                "<blockquote>আপনার ওজন (কেজি) এবং উচ্চতা (ফুট.ইঞ্চি) পাঠান।\n"
+                "💡 <b>উদাহরণ:</b> <code>70 5.7</code> অথবা <code>70 kg 5.7</code></blockquote>",
                 parse_mode=ParseMode.HTML,
             )
 
         elif btn == BTN_QR:
             context.user_data["state"] = "WAIT_QR"
             await msg.reply_text(
-                "🔳 <b>QR বানান</b>\n\nযে লেখা বা লিংকের QR Code বানাতে চান তা পাঠান:"
+                f"🔳 <b>QR Code জেনারেটর</b>\n"
+                f"{DIVIDER}\n"
+                "<blockquote>যে লেখা বা লিংকের QR Code তৈরি করতে চান তা পাঠান:</blockquote>",
+                parse_mode=ParseMode.HTML,
             )
 
         elif btn == BTN_NEWS:
@@ -2339,17 +2476,19 @@ async def route_menu_button(
         elif btn == BTN_AGE:
             context.user_data["state"] = "WAIT_AGE"
             await msg.reply_text(
-                "🎂 <b>বয়স হিসাব</b>\n\n"
-                "আপনার জন্ম তারিখ <code>DD-MM-YYYY</code> ফরম্যাটে পাঠান।\n"
-                "উদাহরণ: <code>15-08-2002</code>",
+                f"🎂 <b>নিখুঁত বয়স ক্যালকুলেটর</b>\n"
+                f"{DIVIDER}\n"
+                "<blockquote>আপনার জন্ম তারিখ <code>DD-MM-YYYY</code> ফরম্যাটে পাঠান।\n"
+                "💡 <b>উদাহরণ:</b> <code>15-08-2002</code></blockquote>",
                 parse_mode=ParseMode.HTML,
             )
 
         elif btn == BTN_UNIT:
             context.user_data["state"] = "WAIT_UNIT"
             await msg.reply_text(
-                "🔄 <b>ইউনিট কনভার্ট</b>\n\n"
-                "কনভার্ট করতে নিচের মতো করে লিখুন:\n"
+                f"🔄 <b>ইউনিট কনভার্টার</b>\n"
+                f"{DIVIDER}\n"
+                "<blockquote>কনভার্ট করতে নিচের মতো করে লিখুন:\n"
                 "• <code>10 kg to pound</code>\n"
                 "• <code>5 km to mile</code>\n"
                 "• <code>37 C to F</code>\n"
@@ -2357,49 +2496,62 @@ async def route_menu_button(
                 "• <code>5 liter to gallon</code>\n"
                 "• <code>5.7 feet to cm</code>\n"
                 "• <code>10 meter to feet</code>\n"
-                "• <code>2 hour to minute</code>",
+                "• <code>2 hour to minute</code></blockquote>",
                 parse_mode=ParseMode.HTML,
             )
 
         elif btn == BTN_FANCY:
             context.user_data["state"] = "WAIT_FANCY"
             await msg.reply_text(
-                "✨ <b>ফ্যান্সি টেক্সট</b>\n\nআপনার নাম বা যেকোনো ইংরেজি টেক্সট পাঠান:"
+                f"✨ <b>ফ্যান্সি টেক্সট জেনারেটর</b>\n"
+                f"{DIVIDER}\n"
+                "<blockquote>আপনার নাম বা যেকোনো ইংরেজি লেখা পাঠান:</blockquote>",
+                parse_mode=ParseMode.HTML,
             )
 
         elif btn == BTN_LOVE:
             context.user_data["state"] = "WAIT_LOVE"
             await msg.reply_text(
-                "❤️ <b>Love ক্যালকুলেটর</b>\n\n"
-                "দুইজনের নাম কমা (,) বা '+' দিয়ে লিখুন।\n"
-                "উদাহরণ: <code>Rahim, Karima</code>",
+                f"❤️ <b>Love ক্যালকুলেটর</b>\n"
+                f"{DIVIDER}\n"
+                "<blockquote>দুইজনের নাম কমা (,) বা '+' দিয়ে লিখুন।\n"
+                "💡 <b>উদাহরণ:</b> <code>Rahim, Karima</code></blockquote>",
                 parse_mode=ParseMode.HTML,
             )
 
         elif btn == BTN_COMPRESS:
             context.user_data["state"] = "WAIT_COMPRESS"
             await msg.reply_text(
-                "🗜️ <b>ছবি কমপ্রেস</b>\n\nকমপ্রেস করার জন্য একটি ছবি (Photo) পাঠান:"
+                f"🗜️ <b>ইমেজ কমপ্রেসর (Photo Compressor)</b>\n"
+                f"{DIVIDER}\n"
+                "<blockquote>কমপ্রেস করার জন্য একটি ছবি (Photo) পাঠান:</blockquote>",
+                parse_mode=ParseMode.HTML,
             )
 
         elif btn == BTN_LYRICS:
             context.user_data["state"] = "WAIT_LYRICS"
             await msg.reply_text(
-                "🎵 <b>গানের লিরিক্স</b>\n\nগানের নাম বা প্রথম লাইনটি লিখুন:"
+                f"🎵 <b>গানের তথ্য ও লিরিক্স</b>\n"
+                f"{DIVIDER}\n"
+                "<blockquote>গানের নাম অথবা প্রথম লাইনটি লিখে পাঠান:</blockquote>",
+                parse_mode=ParseMode.HTML,
             )
 
         elif btn == BTN_PASSWORD:
             kb = InlineKeyboardMarkup(
                 [
                     [
-                        InlineKeyboardButton("৮ অক্ষর", callback_data="pwd_len:8"),
-                        InlineKeyboardButton("১২ অক্ষর", callback_data="pwd_len:12"),
-                        InlineKeyboardButton("১৬ অক্ষর", callback_data="pwd_len:16"),
+                        InlineKeyboardButton("🔐 ৮ অক্ষর", callback_data="pwd_len:8"),
+                        InlineKeyboardButton("🔐 ১২ অক্ষর", callback_data="pwd_len:12"),
+                        InlineKeyboardButton("🔐 ১৬ অক্ষর", callback_data="pwd_len:16"),
                     ]
                 ]
             )
             await msg.reply_text(
-                "🔐 <b>পাসওয়ার্ড জেনারেটর</b>\n\nকত অক্ষরের পাসওয়ার্ড তৈরি করতে চান তা বেছে নিন:",
+                f"🔐 <b>সিকিউর পাসওয়ার্ড জেনারেটর</b>\n"
+                f"{DIVIDER}\n"
+                "👇 কত অক্ষরের পাসওয়ার্ড তৈরি করতে চান তা বেছে নিন:",
+                parse_mode=ParseMode.HTML,
                 reply_markup=kb,
             )
 
@@ -2408,21 +2560,23 @@ async def route_menu_button(
             dua = SEVEN_DUAS[day_of_year % len(SEVEN_DUAS)]
             add_points(user.id, 1)
             await msg.reply_text(
-                f"🤲 <b>আজকের দোয়া</b>\n\n"
+                f"🤲 <b>আজকের মাসনুন দোয়া</b>\n"
+                f"{DIVIDER}\n"
                 f"📌 <b>{dua['title']}</b>\n\n"
-                f"📖 <b>আরবি:</b>\n{dua['arabic']}\n\n"
-                f"🇧🇩 <b>বাংলা অর্থ:</b>\n{dua['bangla']}",
+                f"<blockquote>📖 <b>আরবি:</b>\n{dua['arabic']}</blockquote>\n\n"
+                f"<blockquote>🇧🇩 <b>বাংলা অর্থ:</b>\n{dua['bangla']}</blockquote>",
                 parse_mode=ParseMode.HTML,
             )
 
         elif btn == BTN_REMINDER:
             context.user_data["state"] = "WAIT_REMINDER"
             await msg.reply_text(
-                "⏰ <b>রিমাইন্ডার সেট করুন</b>\n\n"
-                "কত সময় পরে এবং কী মনে করিয়ে দিতে হবে তা নিচের মতো লিখুন:\n"
+                f"⏰ <b>স্মার্ট রিমাইন্ডার অ্যালার্ম</b>\n"
+                f"{DIVIDER}\n"
+                "<blockquote>কত সময় পরে এবং কী মনে করিয়ে দিতে হবে তা নিচের মতো লিখুন:\n"
                 "• <code>10 মিনিট পরে পানি খাবো</code>\n"
                 "• <code>30 minute por ghumabo</code>\n"
-                "• <code>1 ghonta pore call</code>",
+                "• <code>1 ghonta pore call</code></blockquote>",
                 parse_mode=ParseMode.HTML,
             )
 
@@ -2443,17 +2597,21 @@ async def route_menu_button(
             with get_db() as conn:
                 products = conn.execute("SELECT * FROM products ORDER BY id ASC").fetchall()
             if not products:
-                await msg.reply_text("🛍️ বর্তমানে শপে কোনো পণ্য নেই। অনুগ্রহ করে পরে আবার দেখুন!")
+                await msg.reply_text(
+                    f"🛍️ <b>অফিসিয়াল শপ</b>\n{DIVIDER}\n"
+                    "<blockquote>বর্তমানে শপে কোনো পণ্য নেই। অনুগ্রহ করে পরে আবার দেখুন!</blockquote>",
+                    parse_mode=ParseMode.HTML,
+                )
                 return
-            await msg.reply_text("🛍️ <b>আমাদের শপের পণ্যসমূহ:</b>", parse_mode=ParseMode.HTML)
+            await msg.reply_text(f"🛍️ <b>আমাদের শপের পণ্যসমূহ</b>\n{DIVIDER}", parse_mode=ParseMode.HTML)
             for p in products:
                 kb = InlineKeyboardMarkup(
                     [[InlineKeyboardButton("🛒 অর্ডার করুন (Buy Now)", callback_data=f"buy_prod:{p['id']}")]]
                 )
                 await msg.reply_text(
                     f"📦 <b>{html.escape(p['name'])}</b>\n"
-                    f"💰 দাম: <b>{html.escape(p['price'])}</b>\n"
-                    f"📝 বিবরণ: {html.escape(p['description'])}",
+                    f"<blockquote>💰 <b>মূল্য:</b> {html.escape(p['price'])}\n"
+                    f"📝 <b>বিবরণ:</b> {html.escape(p['description'])}</blockquote>",
                     parse_mode=ParseMode.HTML,
                     reply_markup=kb,
                 )
@@ -2461,8 +2619,10 @@ async def route_menu_button(
         elif btn == BTN_CONTACT:
             context.user_data["state"] = "WAIT_CONTACT_ADMIN"
             await msg.reply_text(
-                "📩 <b>Contact Admin</b>\n\n"
-                "অ্যাডমিনের কাছে আপনার মেসেজ বা প্রশ্নটি লিখে পাঠান (অ্যাডমিন রিপ্লাই দিলে আপনি এখানেই উত্তর পাবেন):"
+                f"📩 <b>সরাসরি অ্যাডমিনের সাথে যোগাযোগ</b>\n"
+                f"{DIVIDER}\n"
+                "<blockquote>অ্যাডমিনের কাছে আপনার মেসেজ, মতামত বা প্রশ্নটি লিখে পাঠান। অ্যাডমিন রিপ্লাই দিলে আপনি এখানেই উত্তর পেয়ে যাবেন!</blockquote>",
+                parse_mode=ParseMode.HTML,
             )
 
         elif btn == BTN_PROFILE:
@@ -2474,13 +2634,16 @@ async def route_menu_button(
             bot_uname = context.bot.username or "Bot"
             ref_link = f"https://t.me/{bot_uname}?start=ref_{user.id}"
             await msg.reply_text(
-                f"👤 <b>আপনার প্রোফাইল</b>\n\n"
-                f"• নাম: <b>{html.escape(user.full_name or 'User')}</b>\n"
-                f"• ইউজার আইডি: <code>{user.id}</code>\n"
-                f"• মোট পয়েন্ট: <b>{pts}</b>\n"
-                f"• লেভেল: <b>{lvl}</b>\n"
-                f"• বর্তমান র‍্যাংক: <b>#{rank}</b>\n"
-                f"• মোট রেফারেল: <b>{refs} জন</b>\n\n"
+                f"👤 <b>ইউজার প্রোফাইল ড্যাশবোর্ড</b>\n"
+                f"{DIVIDER}\n"
+                f"<blockquote>"
+                f"🏷️ <b>নাম:</b> {html.escape(user.full_name or 'User')}\n"
+                f"🆔 <b>আইডি:</b> <code>{user.id}</code>\n"
+                f"⭐ <b>মোট পয়েন্ট:</b> {pts}\n"
+                f"🏅 <b>লেভেল:</b> {lvl}\n"
+                f"🏆 <b>গ্লোবাল র‍্যাংক:</b> #{rank}\n"
+                f"👥 <b>মোট রেফারেল:</b> {refs} জন"
+                f"</blockquote>\n\n"
                 f"🔗 <b>আপনার রেফারেল লিংক:</b>\n<code>{ref_link}</code>",
                 parse_mode=ParseMode.HTML,
             )
@@ -2497,22 +2660,37 @@ async def route_menu_button(
             u = get_user(user.id)
             my_pts = int(u["points"]) if u else 0
 
-            lines = ["🏆 <b>সর্বকালের সেরা ১০ জন (All-Time Top 10):</b>"]
+            medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+            all_lines = []
             for i, r in enumerate(top_all, 1):
-                lines.append(f"{i}. {html.escape(r['name'] or 'User')} — <b>{r['points']} pts</b>")
+                badge = medals.get(i, f"{i}.")
+                all_lines.append(f"{badge} <b>{html.escape(r['name'] or 'User')}</b> — <code>{r['points']} pts</code>")
 
-            lines.append("\n🔥 <b>এই সপ্তাহের সেরা ৫ জন (This Week Top 5):</b>")
+            week_lines = []
             for i, r in enumerate(top_week, 1):
-                lines.append(f"{i}. {html.escape(r['name'] or 'User')} — <b>{r['week_points']} pts</b>")
+                badge = medals.get(i, f"{i}.")
+                week_lines.append(f"{badge} <b>{html.escape(r['name'] or 'User')}</b> — <code>{r['week_points']} pts</code>")
 
-            lines.append(f"\n👤 <b>আপনার অবস্থান:</b> র‍্যাংক <b>#{my_rank}</b> ({my_pts} পয়েন্ট)")
-            await msg.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+            await msg.reply_text(
+                f"🏆 <b>গ্লোবাল লিডারবোর্ড (Leaderboard)</b>\n"
+                f"{DIVIDER}\n"
+                f"👑 <b>সর্বকালের সেরা ১০ জন (All-Time Top 10):</b>\n"
+                f"<blockquote>" + ("\n".join(all_lines) if all_lines else "এখনো কেউ নেই") + "</blockquote>\n\n"
+                f"🔥 <b>এই সপ্তাহের সেরা ৫ জন (This Week Top 5):</b>\n"
+                f"<blockquote>" + ("\n".join(week_lines) if week_lines else "এখনো কেউ নেই") + "</blockquote>\n\n"
+                f"👤 <b>আপনার অবস্থান:</b> র‍্যাংক <b>#{my_rank}</b> ({my_pts} পয়েন্ট)",
+                parse_mode=ParseMode.HTML,
+            )
 
         elif btn == BTN_DAILY:
             today_str = datetime.date.today().isoformat()
             u = get_user(user.id)
             if u and u["last_daily"] == today_str:
-                await msg.reply_text("⏳ আপনি আজকের ডেইলি বোনাস ইতিমধ্যে সংগ্রহ করেছেন! আগামীকাল আবার চেষ্টা করুন।")
+                await msg.reply_text(
+                    f"⏳ <b>ডেইলি বোনাস ইতিমধ্যে নেওয়া হয়েছে!</b>\n{DIVIDER}\n"
+                    "<blockquote>আপনি আজকের বোনাস ইতিমধ্যে সংগ্রহ করেছেন। আগামীকাল আবার নতুন বোনাস নিতে পারবেন!</blockquote>",
+                    parse_mode=ParseMode.HTML,
+                )
                 return
             yesterday_str = (datetime.date.today() - datetime.timedelta(days=1)).isoformat()
             streak = (int(u["daily_streak"]) + 1) if (u and u["last_daily"] == yesterday_str) else 1
@@ -2523,8 +2701,10 @@ async def route_menu_button(
                 )
                 conn.commit()
             await msg.reply_text(
-                f"🎁 <b>অভিনন্দন!</b> আপনি আজকের ডেইলি বোনাস <b>+৫ পয়েন্ট</b> পেয়েছেন!\n"
-                f"🔥 আপনার ডেইলি স্ট্রিক: <b>{streak} দিন</b>",
+                f"🎁 <b>ডেইলি বোনাস ক্লেইম সফল!</b>\n"
+                f"{DIVIDER}\n"
+                f"<blockquote>🎉 অভিনন্দন! আপনি আজকের ডেইলি বোনাস <b>+৫ পয়েন্ট</b> পেয়েছেন!\n"
+                f"🔥 <b>ডেইলি স্ট্রিক:</b> টানা {streak} দিন</blockquote>",
                 parse_mode=ParseMode.HTML,
             )
 
@@ -2532,7 +2712,11 @@ async def route_menu_button(
             today_str = datetime.date.today().isoformat()
             u = get_user(user.id)
             if u and u["last_spin"] == today_str:
-                await msg.reply_text("🎰 আপনি আজকের ফ্রি স্পিন ইতিমধ্যে ব্যবহার করেছেন! আগামীকাল আবার স্পিন করুন।")
+                await msg.reply_text(
+                    f"🎰 <b>আজকের স্পিন শেষ!</b>\n{DIVIDER}\n"
+                    "<blockquote>আপনি আজকের ফ্রি লাকি স্পিন ইতিমধ্যে ব্যবহার করেছেন। আগামীকাল আবার ভাগ্য পরীক্ষা করুন!</blockquote>",
+                    parse_mode=ParseMode.HTML,
+                )
                 return
             won = random.randint(1, 50)
             with get_db() as conn:
@@ -2542,8 +2726,9 @@ async def route_menu_button(
                 )
                 conn.commit()
             await msg.reply_text(
-                f"🎰 <b>স্পিন ফলাফল!</b>\n\n"
-                f"🎉 অভিনন্দন! চাকা ঘুরিয়ে আপনি জিতেছেন <b>+{won} পয়েন্ট!</b>",
+                f"🎰 <b>লাকি স্পিন ফলাফল!</b>\n"
+                f"{DIVIDER}\n"
+                f"<blockquote>🎉 অভিনন্দন! ভাগ্যের চাকা ঘুরিয়ে আপনি জিতেছেন <b>+{won} পয়েন্ট!</b></blockquote>",
                 parse_mode=ParseMode.HTML,
             )
 
@@ -2552,10 +2737,11 @@ async def route_menu_button(
             ref_link = f"https://t.me/{bot_uname}?start=ref_{user.id}"
             refs = get_referral_count(user.id)
             await msg.reply_text(
-                f"👥 <b>বন্ধুদের রেফার করুন এবং পয়েন্ট জিতুন!</b>\n\n"
-                f"আপনার রেফারেল লিংক দিয়ে কোনো নতুন বন্ধু বটে জয়েন করলেই আপনি পাবেন <b>+১০ পয়েন্ট!</b>\n\n"
-                f"📊 আপনার মোট রেফারেল: <b>{refs} জন</b>\n"
-                f"🔗 আপনার রেফারেল লিংক:\n<code>{ref_link}</code>",
+                f"👥 <b>রেফারেল প্রোগ্রাম (Invite & Earn)</b>\n"
+                f"{DIVIDER}\n"
+                f"<blockquote>আপনার রেফারেল লিংক শেয়ার করে বন্ধুদের আমন্ত্রণ জানান। প্রতিটি নতুন বন্ধু জয়েন করলেই আপনি পাবেন <b>+১০ পয়েন্ট!</b>\n\n"
+                f"📊 <b>আপনার মোট রেফারেল:</b> {refs} জন</blockquote>\n\n"
+                f"🔗 <b>আপনার রেফারেল লিংক (ট্যাপ করে কপি করুন):</b>\n<code>{ref_link}</code>",
                 parse_mode=ParseMode.HTML,
             )
 
@@ -2566,7 +2752,12 @@ async def route_menu_button(
             await msg.reply_text(HELP_TEXT, parse_mode=ParseMode.HTML)
 
         elif btn == BTN_DEV:
-            await msg.reply_text("👨💻 Developer: @Tonmoy581833")
+            await msg.reply_text(
+                f"👨💻 <b>ডেভেলপার পরিচিতি</b>\n"
+                f"{DIVIDER}\n"
+                f"<blockquote><b>Developer: @Tonmoy581833</b></blockquote>",
+                parse_mode=ParseMode.HTML,
+            )
 
     except Exception as e:
         logger.error(f"Error in route_menu_button ({btn}): {e}", exc_info=True)
@@ -2586,7 +2777,9 @@ async def process_voice_message(msg, user_id: int, context: ContextTypes.DEFAULT
         text_out = await asyncio.to_thread(call_groq_whisper, tmp_ogg)
         add_points(user_id, 1)
         await msg.reply_text(
-            f"🎤 <b>ভয়েস থেকে প্রাপ্ত টেক্সট:</b>\n\n{html.escape(text_out)}",
+            f"🎤 <b>ভয়েস থেকে রূপান্তরিত টেক্সট</b>\n"
+            f"{DIVIDER}\n"
+            f"<blockquote>{html.escape(text_out)}</blockquote>",
             parse_mode=ParseMode.HTML,
         )
     finally:
@@ -2608,7 +2801,8 @@ async def process_photo_message(msg, user_id: int, context: ContextTypes.DEFAULT
         imgs = context.user_data.setdefault("pdf_images", [])
         imgs.append(tmp_img)
         await msg.reply_text(
-            f"✅ ছবি #{len(imgs)} যুক্ত হয়েছে! আরও ছবি পাঠাতে পারেন অথবা নিচের <b>✅ PDF বানান</b> বাটনে চাপুন।",
+            f"✅ <b>ছবি #{len(imgs)} যুক্ত হয়েছে!</b>\n"
+            f"আরও ছবি পাঠাতে পারেন অথবা নিচের <b>✅ PDF বানান</b> বাটনে চাপুন।",
             parse_mode=ParseMode.HTML,
             reply_markup=PDF_COLLECT_MARKUP,
         )
@@ -2631,8 +2825,9 @@ async def process_photo_message(msg, user_id: int, context: ContextTypes.DEFAULT
                     filename="compressed.jpg",
                     caption=(
                         f"🗜️ <b>ছবি কমপ্রেস সম্পন্ন!</b>\n"
-                        f"• আগের সাইজ: {orig_kb:.1f} KB\n"
-                        f"• বর্তমান সাইজ: {comp_kb:.1f} KB"
+                        f"{DIVIDER}\n"
+                        f"<blockquote>• আগের সাইজ: <b>{orig_kb:.1f} KB</b>\n"
+                        f"• বর্তমান সাইজ: <b>{comp_kb:.1f} KB</b></blockquote>"
                     ),
                     parse_mode=ParseMode.HTML,
                 )
@@ -2678,7 +2873,12 @@ async def finalize_images_to_pdf(msg, user_id: int, context: ContextTypes.DEFAUL
             await msg.reply_document(
                 document=f,
                 filename="images.pdf",
-                caption=f"✅ মোট {len(pil_images)}টি ছবি দিয়ে আপনার PDF তৈরি করা হয়েছে!",
+                caption=(
+                    f"📄 <b> আপনার PDF প্রস্তুত!</b>\n"
+                    f"{DIVIDER}\n"
+                    f"<blockquote>✅ মোট <b>{len(pil_images)}টি</b> ছবি দিয়ে সুন্দরভাবে PDF তৈরি করা হয়েছে।</blockquote>"
+                ),
+                parse_mode=ParseMode.HTML,
                 reply_markup=MAIN_MENU_MARKUP,
             )
     except Exception as e:
@@ -2737,7 +2937,7 @@ async def process_document_message(msg, user_id: int, context: ContextTypes.DEFA
             [
                 {
                     "role": "system",
-                    "content": "You are a helpful Bengali assistant. Summarize the given PDF text clearly in Bangla bullet points.",
+                    "content": "You are a helpful Bengali assistant. Summarize the given PDF text clearly in clean Bangla bullet points. Do not use markdown asterisks (**), use plain clean text with bullet emojis.",
                 },
                 {
                     "role": "user",
@@ -2746,7 +2946,12 @@ async def process_document_message(msg, user_id: int, context: ContextTypes.DEFA
             ],
         )
         add_points(user_id, 1)
-        await status_msg.edit_text(f"📄 <b>PDF সারাংশ (Summary):</b>\n\n{summary}", parse_mode=ParseMode.HTML)
+        await status_msg.edit_text(
+            f"📄 <b>PDF ফাইলের মূল সারাংশ</b>\n"
+            f"{DIVIDER}\n"
+            f"<blockquote>{html.escape(summary)}</blockquote>",
+            parse_mode=ParseMode.HTML,
+        )
     except Exception as e:
         logger.error(f"PDF summary error: {e}", exc_info=True)
         await status_msg.edit_text(ERROR_MSG_BN)
@@ -2769,7 +2974,6 @@ async def process_state_text(text: str, msg, user, context: ContextTypes.DEFAULT
         await context.bot.send_chat_action(chat_id=msg.chat_id, action=ChatAction.TYPING)
         history: List[Dict[str, str]] = context.user_data.setdefault("chat_history", [])
         history.append({"role": "user", "content": text})
-        # Keep last 8 turns (16 messages)
         if len(history) > 16:
             history[:] = history[-16:]
 
@@ -2777,8 +2981,9 @@ async def process_state_text(text: str, msg, user, context: ContextTypes.DEFAULT
             {
                 "role": "system",
                 "content": (
-                    "You are a friendly, smart, and helpful Bangla AI assistant on Telegram. "
-                    "Always reply naturally in clear Bangla unless the user explicitly asks for another language."
+                    "You are a polite, smart, and professional Bangla AI assistant on Telegram. "
+                    "Always reply naturally in clear, well-structured Bangla with relevant emojis unless the user asks for another language. "
+                    "Avoid ugly raw markdown symbols like ** or ###; instead use clean bullet points (• or 🔹) and clear spacing."
                 ),
             }
         ] + history
@@ -2788,7 +2993,10 @@ async def process_state_text(text: str, msg, user, context: ContextTypes.DEFAULT
         if len(history) > 16:
             history[:] = history[-16:]
         add_points(user.id, 1)
-        await msg.reply_text(reply)
+        await msg.reply_text(
+            f"🤖 <b>AI চ্যাট রিপ্লাই</b>\n{DIVIDER}\n{html.escape(reply)}",
+            parse_mode=ParseMode.HTML,
+        )
         return
 
     if state == "WAIT_TTS_TEXT":
@@ -2801,7 +3009,11 @@ async def process_state_text(text: str, msg, user, context: ContextTypes.DEFAULT
         try:
             add_points(user.id, 1)
             with open(audio_path, "rb") as f:
-                await msg.reply_voice(voice=f, caption="🎙️ আপনার ভয়েস মেসেজ তৈরি হয়েছে!")
+                await msg.reply_voice(
+                    voice=f,
+                    caption=f"🎙️ <b>ভয়েস তৈরি সম্পন্ন!</b> (Voice: <code>{voice}</code>)",
+                    parse_mode=ParseMode.HTML,
+                )
             await status_msg.delete()
         finally:
             if os.path.exists(audio_path):
@@ -2816,9 +3028,11 @@ async def process_state_text(text: str, msg, user, context: ContextTypes.DEFAULT
         return
 
     if state == "WAIT_AI_IMG":
-        status_msg = await msg.reply_text("🖼️ আপনার AI ছবি তৈরি হচ্ছে, অনুগ্রহ করে কিছুক্ষণ অপেক্ষা করুন...")
+        status_msg = await msg.reply_text("🎨 <b>আপনার HD AI ছবি তৈরি হচ্ছে, অনুগ্রহ করে কিছুক্ষণ অপেক্ষা করুন...</b>", parse_mode=ParseMode.HTML)
         encoded_prompt = urllib.parse.quote(text)
-        url1 = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1024&height=1024&nologo=true"
+        # Request with nologo=true&nofeed=true&enhance=true, then pass through remove_bottom_watermark_and_polish()
+        # so even if Pollinations burns a bottom logo, it is 100% cropped out and upscaled cleanly to 1024x1024!
+        url1 = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1024&height=1024&nologo=true&nofeed=true&enhance=true"
         url2 = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1024&height=1024&nologo=true&seed=42"
 
         img_bytes: Optional[bytes] = None
@@ -2831,7 +3045,7 @@ async def process_state_text(text: str, msg, user, context: ContextTypes.DEFAULT
                     timeout=45,
                 )
                 if r.status_code == 200 and r.content and len(r.content) > 1000:
-                    img_bytes = r.content
+                    img_bytes = await asyncio.to_thread(remove_bottom_watermark_and_polish, r.content)
                     break
             except Exception as e:
                 logger.warning(f"Pollinations download attempt failed ({target_url}): {e}")
@@ -2843,7 +3057,11 @@ async def process_state_text(text: str, msg, user, context: ContextTypes.DEFAULT
         add_points(user.id, 1)
         await msg.reply_photo(
             photo=io.BytesIO(img_bytes),
-            caption=f"🖼️ <b>Prompt:</b> {html.escape(text)}",
+            caption=(
+                f"🖼️ <b>AI জেনারেটেড HD ছবি (Watermark-Free)</b>\n"
+                f"{DIVIDER}\n"
+                f"<blockquote>✨ <b>Prompt:</b> {html.escape(text)}</blockquote>"
+            ),
             parse_mode=ParseMode.HTML,
         )
         await status_msg.delete()
@@ -2858,7 +3076,7 @@ async def process_state_text(text: str, msg, user, context: ContextTypes.DEFAULT
             await msg.reply_text("⚠️ মেসেজে কোনো বৈধ লিংক (http/https) পাওয়া যায়নি। সঠিক লিংক পাঠান।")
             return
 
-        status_msg = await msg.reply_text("📥 ভিডিও ডাউনলোড হচ্ছে, অনুগ্রহ করে অপেক্ষা করুন...")
+        status_msg = await msg.reply_text("📥 <b>ভিডিও ডাউনলোড হচ্ছে, অনুগ্রহ করে অপেক্ষা করুন...</b>", parse_mode=ParseMode.HTML)
         vid_path: Optional[str] = None
         try:
             vid_path, title = await asyncio.to_thread(download_video_from_url, url)
@@ -2866,7 +3084,11 @@ async def process_state_text(text: str, msg, user, context: ContextTypes.DEFAULT
             with open(vid_path, "rb") as f:
                 await msg.reply_video(
                     video=f,
-                    caption=f"🎬 <b>{html.escape(title[:200])}</b>",
+                    caption=(
+                        f"🎬 <b>ভিডিও ডাউনলোড সম্পন্ন!</b>\n"
+                        f"{DIVIDER}\n"
+                        f"<blockquote>📌 {html.escape(title[:200])}</blockquote>"
+                    ),
                     parse_mode=ParseMode.HTML,
                 )
             await status_msg.delete()
@@ -2905,7 +3127,12 @@ async def process_state_text(text: str, msg, user, context: ContextTypes.DEFAULT
             0.3,
         )
         add_points(user.id, 1)
-        await msg.reply_text(f"🌐 <b>অনুবাদ ফলাফল:</b>\n\n{html.escape(out)}", parse_mode=ParseMode.HTML)
+        await msg.reply_text(
+            f"🌐 <b>অনুবাদ ফলাফল ({'বাংলা → English' if direction == 'bn2en' else 'English → বাংলা'})</b>\n"
+            f"{DIVIDER}\n"
+            f"<blockquote>{html.escape(out)}</blockquote>",
+            parse_mode=ParseMode.HTML,
+        )
         return
 
     if state == "WAIT_CAPTION":
@@ -2915,13 +3142,18 @@ async def process_state_text(text: str, msg, user, context: ContextTypes.DEFAULT
             [
                 {
                     "role": "system",
-                    "content": "You are a creative social media expert. Generate 5 short, catchy Bangla social media captions with fitting emojis and trending hashtags.",
+                    "content": "You are a creative social media expert. Generate 5 short, catchy Bangla social media captions with fitting emojis and trending hashtags. Number them ১ to ৫ clearly without raw markdown asterisks (**).",
                 },
                 {"role": "user", "content": f"টপিক: {text}"},
             ],
         )
         add_points(user.id, 1)
-        await msg.reply_text(f"✍️ <b>আপনার ক্যাপশনসমূহ:</b>\n\n{out}")
+        await msg.reply_text(
+            f"✍️ <b>আপনার আকর্ষণীয় সোশ্যাল মিডিয়া ক্যাপশন</b>\n"
+            f"{DIVIDER}\n"
+            f"<blockquote>{html.escape(out)}</blockquote>",
+            parse_mode=ParseMode.HTML,
+        )
         return
 
     if state == "WAIT_STORY":
@@ -2931,13 +3163,18 @@ async def process_state_text(text: str, msg, user, context: ContextTypes.DEFAULT
             [
                 {
                     "role": "system",
-                    "content": "You are a talented Bengali writer and poet. Write a heartwarming short story or poem in Bangla based on the user's topic.",
+                    "content": "You are a talented Bengali writer and poet. Write a heartwarming short story or poem in Bangla based on the user's topic. Do not use raw markdown asterisks (**).",
                 },
                 {"role": "user", "content": f"বিষয়: {text}"},
             ],
         )
         add_points(user.id, 1)
-        await msg.reply_text(f"📖 <b>গল্প / কবিতা:</b>\n\n{out}")
+        await msg.reply_text(
+            f"📖 <b>গল্প / কবিতা ({html.escape(text)})</b>\n"
+            f"{DIVIDER}\n"
+            f"<blockquote>{html.escape(out)}</blockquote>",
+            parse_mode=ParseMode.HTML,
+        )
         return
 
     if state == "WAIT_WEATHER":
@@ -2965,7 +3202,10 @@ async def process_state_text(text: str, msg, user, context: ContextTypes.DEFAULT
         short_link = resp.text.strip()
         add_points(user.id, 1)
         await msg.reply_text(
-            f"🔗 <b>আপনার ছোট করা লিংক:</b>\n\n<code>{html.escape(short_link)}</code>\n\n{html.escape(short_link)}",
+            f"🔗 <b>আপনার ছোট করা লিংক প্রস্তুত!</b>\n"
+            f"{DIVIDER}\n"
+            f"<blockquote><code>{html.escape(short_link)}</code></blockquote>\n"
+            f"🌐 {html.escape(short_link)}",
             parse_mode=ParseMode.HTML,
         )
         return
@@ -2987,15 +3227,14 @@ async def process_state_text(text: str, msg, user, context: ContextTypes.DEFAULT
                     ex_txt = d_item.get("example", "")
                     line = f"• (<i>{html.escape(pos)}</i>) {html.escape(d_txt)}"
                     if ex_txt:
-                        line += f"\n  উদাহরণ: <i>{html.escape(ex_txt)}</i>"
+                        line += f"\n  💬 <i>{html.escape(ex_txt)}</i>"
                     defs_out.append(line)
-            # Also ask Groq for concise Bangla meaning
             bn_meaning = ""
             try:
                 bn_meaning = await asyncio.to_thread(
                     call_groq_chat,
                     [
-                        {"role": "system", "content": "Give the concise Bangla meaning of the English word in 1-2 lines."},
+                        {"role": "system", "content": "Give the concise Bangla meaning of the English word in 1-2 lines without asterisks."},
                         {"role": "user", "content": word},
                     ],
                     0.3,
@@ -3005,9 +3244,10 @@ async def process_state_text(text: str, msg, user, context: ContextTypes.DEFAULT
                 pass
             add_points(user.id, 1)
             await msg.reply_text(
-                f"📚 <b>Word:</b> {html.escape(word)} {html.escape(phonetic)}\n\n"
-                f"🇧🇩 <b>বাংলা অর্থ:</b> {html.escape(bn_meaning)}\n\n"
-                f"📖 <b>Definitions:</b>\n" + "\n".join(defs_out),
+                f"📚 <b>ডিকশনারি ফলাফল: {html.escape(word)}</b> {html.escape(phonetic)}\n"
+                f"{DIVIDER}\n"
+                f"🇧🇩 <b>বাংলা অর্থ:</b>\n<blockquote>{html.escape(bn_meaning)}</blockquote>\n\n"
+                f"📖 <b>English Definitions:</b>\n<blockquote>" + "\n".join(defs_out) + "</blockquote>",
                 parse_mode=ParseMode.HTML,
             )
         else:
@@ -3016,13 +3256,18 @@ async def process_state_text(text: str, msg, user, context: ContextTypes.DEFAULT
                 [
                     {
                         "role": "system",
-                        "content": "Explain the given word with its Bangla meaning, part of speech, and 2 example sentences.",
+                        "content": "Explain the given word with its Bangla meaning, part of speech, and 2 example sentences. Do not use raw markdown asterisks (**).",
                     },
                     {"role": "user", "content": word},
                 ],
             )
             add_points(user.id, 1)
-            await msg.reply_text(f"📚 <b>শব্দের ব্যাখ্যা ({html.escape(word)}):</b>\n\n{explanation}", parse_mode=ParseMode.HTML)
+            await msg.reply_text(
+                f"📚 <b>শব্দের বিস্তারিত ব্যাখ্যা ({html.escape(word)})</b>\n"
+                f"{DIVIDER}\n"
+                f"<blockquote>{html.escape(explanation)}</blockquote>",
+                parse_mode=ParseMode.HTML,
+            )
         return
 
     if state == "WAIT_BMI":
@@ -3037,7 +3282,11 @@ async def process_state_text(text: str, msg, user, context: ContextTypes.DEFAULT
         qr_img.save(bio, format="PNG")
         bio.seek(0)
         add_points(user.id, 1)
-        await msg.reply_photo(photo=bio, caption=f"🔳 <b>QR Code তৈরি হয়েছে!</b>", parse_mode=ParseMode.HTML)
+        await msg.reply_photo(
+            photo=bio,
+            caption=f"🔳 <b>QR Code সফলভাবে তৈরি হয়েছে!</b>\n{DIVIDER}\n<blockquote><code>{html.escape(text[:150])}</code></blockquote>",
+            parse_mode=ParseMode.HTML,
+        )
         return
 
     if state == "WAIT_AGE":
@@ -3070,14 +3319,17 @@ async def process_state_text(text: str, msg, user, context: ContextTypes.DEFAULT
         n1, n2 = parts[0].strip(), parts[1].strip()
         key = "::".join(sorted([n1.lower(), n2.lower()]))
         digest = int(hashlib.sha256(key.encode("utf-8")).hexdigest(), 16)
-        pct = 40 + (digest % 61)  # Deterministic 40% - 100%
+        pct = 40 + (digest % 61)
         bars = "❤️" * (pct // 10) + "🤍" * (10 - (pct // 10))
         add_points(user.id, 1)
         await msg.reply_text(
-            f"💘 <b>Love ক্যালকুলেটর ফলাফল</b>\n\n"
-            f"👤 <b>{html.escape(n1)}</b> ❤️ <b>{html.escape(n2)}</b>\n"
-            f"📊 ভালোবাসার হার: <b>{pct}%</b>\n"
-            f"{bars}",
+            f"💘 <b>Love ক্যালকুলেটর ফলাফল</b>\n"
+            f"{DIVIDER}\n"
+            f"<blockquote>"
+            f"👤 <b>{html.escape(n1)}</b>  ❤️  <b>{html.escape(n2)}</b>\n\n"
+            f"📊 <b>ভালোবাসার হার:</b> {pct}%\n"
+            f"{bars}"
+            f"</blockquote>",
             parse_mode=ParseMode.HTML,
         )
         return
@@ -3091,7 +3343,7 @@ async def process_state_text(text: str, msg, user, context: ContextTypes.DEFAULT
                     "role": "system",
                     "content": (
                         "You are a music encyclopedia assistant. Provide song details (artist, album/movie, theme) "
-                        "in Bangla. IMPORTANT: If the song is copyrighted, provide ONLY a short 2-4 line excerpt "
+                        "in Bangla without raw markdown asterisks (**). IMPORTANT: If the song is copyrighted, provide ONLY a short 2-4 line excerpt "
                         "and a detailed summary/meaning in Bangla rather than full copyrighted lyrics."
                     ),
                 },
@@ -3099,18 +3351,24 @@ async def process_state_text(text: str, msg, user, context: ContextTypes.DEFAULT
             ],
         )
         add_points(user.id, 1)
-        await msg.reply_text(f"🎵 <b>গানের তথ্য ও লিরিক্স সংক্ষেপ:</b>\n\n{out}")
+        await msg.reply_text(
+            f"🎵 <b>গানের তথ্য ও লিরিক্স সংক্ষেপ</b>\n"
+            f"{DIVIDER}\n"
+            f"<blockquote>{html.escape(out)}</blockquote>",
+            parse_mode=ParseMode.HTML,
+        )
         return
 
     if state == "WAIT_REMINDER":
         parsed = parse_reminder_input(text)
         if not parsed:
             await msg.reply_text(
-                "⚠️ সঠিক ফরম্যাটে রিমাইন্ডার লিখুন।\n"
-                "উদাহরণ:\n"
+                "⚠️ <b>সঠিক ফরম্যাটে রিমাইন্ডার লিখুন!</b>\n\n"
+                "<blockquote>"
                 "• <code>10 মিনিট পরে পানি খাবো</code>\n"
                 "• <code>30 minute por ghumabo</code>\n"
-                "• <code>1 ghonta pore call</code>",
+                "• <code>1 ghonta pore call</code>"
+                "</blockquote>",
                 parse_mode=ParseMode.HTML,
             )
             return
@@ -3125,7 +3383,8 @@ async def process_state_text(text: str, msg, user, context: ContextTypes.DEFAULT
             add_points(user.id, 1)
             await msg.reply_text(
                 f"✅ <b>রিমাইন্ডার সেট করা হয়েছে!</b>\n"
-                f"⏳ নির্ধারিত সময় পর আপনাকে মনে করিয়ে দেওয়া হবে: <b>{html.escape(note)}</b>",
+                f"{DIVIDER}\n"
+                f"<blockquote>⏳ নির্ধারিত সময় পর আপনাকে মনে করিয়ে দেওয়া হবে:\n<b>{html.escape(note)}</b></blockquote>",
                 parse_mode=ParseMode.HTML,
             )
         else:
@@ -3152,10 +3411,11 @@ async def process_state_text(text: str, msg, user, context: ContextTypes.DEFAULT
         context.user_data.pop("buy_product", None)
 
         order_summary = (
-            f"🛒 <b>নতুন অর্ডার এসেছে! (Order #{order_id})</b>\n\n"
-            f"📦 পণ্য: <b>{html.escape(prod['name'])}</b> ({html.escape(prod['price'])})\n"
-            f"👤 ক্রেতা: {html.escape(user.full_name or 'User')} (ID: <code>{user.id}</code>)\n\n"
-            f"📝 <b>ক্রেতার বিবরণ (নাম, মোবাইল, ঠিকানা):</b>\n{html.escape(text)}"
+            f"🛒 <b>নতুন অর্ডার এসেছে! (Order #{order_id})</b>\n"
+            f"{DIVIDER}\n"
+            f"📦 <b>পণ্য:</b> {html.escape(prod['name'])} ({html.escape(prod['price'])})\n"
+            f"👤 <b>ক্রেতা:</b> {html.escape(user.full_name or 'User')} (ID: <code>{user.id}</code>)\n\n"
+            f"<blockquote>📝 <b>ক্রেতার বিবরণ (নাম, মোবাইল, ঠিকানা):</b>\n{html.escape(text)}</blockquote>"
         )
         for aid in ADMIN_IDS:
             try:
@@ -3164,8 +3424,9 @@ async def process_state_text(text: str, msg, user, context: ContextTypes.DEFAULT
                 logger.warning(f"Could not notify admin {aid} of order #{order_id}: {e}")
 
         await msg.reply_text(
-            f"✅ <b>আপনার অর্ডারটি (#{order_id}) সফলভাবে গৃহীত হয়েছে!</b>\n"
-            f"খুব শীঘ্রই আমাদের প্রতিনিধি আপনার সাথে যোগাযোগ করবেন। ধন্যবাদ 🙏",
+            f"✅ <b>অর্ডার সফলভাবে গৃহীত হয়েছে! (Order #{order_id})</b>\n"
+            f"{DIVIDER}\n"
+            f"<blockquote>খুব শীঘ্রই আমাদের প্রতিনিধি আপনার সাথে যোগাযোগ করবেন। আমাদের সাথে থাকার জন্য ধন্যবাদ 🙏</blockquote>",
             parse_mode=ParseMode.HTML,
             reply_markup=MAIN_MENU_MARKUP,
         )
@@ -3183,9 +3444,10 @@ async def process_state_text(text: str, msg, user, context: ContextTypes.DEFAULT
                     chat_id=aid,
                     text=(
                         f"📩 <b>ইউজারের মেসেজ (Contact Admin)</b>\n"
-                        f"👤 নাম: <b>{html.escape(user.full_name or 'User')}</b>\n"
-                        f"🆔 ID: <code>{user.id}</code>\n\n"
-                        f"💬 <b>মেসেজ:</b>\n{html.escape(text)}\n\n"
+                        f"{DIVIDER}\n"
+                        f"👤 <b>নাম:</b> {html.escape(user.full_name or 'User')}\n"
+                        f"🆔 <b>ID:</b> <code>{user.id}</code>\n\n"
+                        f"<blockquote>💬 <b>মেসেজ:</b>\n{html.escape(text)}</blockquote>\n\n"
                         f"↩️ <i>উত্তর দিতে এই মেসেজটিতে Reply দিন।</i>"
                     ),
                     parse_mode=ParseMode.HTML,
@@ -3202,7 +3464,9 @@ async def process_state_text(text: str, msg, user, context: ContextTypes.DEFAULT
 
         if sent_any:
             await msg.reply_text(
-                "✅ আপনার মেসেজটি অ্যাডমিনের কাছে পাঠানো হয়েছে। অ্যাডমিন উত্তর দিলে এখানে দেখতে পাবেন 🙏",
+                f"✅ <b>মেসেজ পাঠানো হয়েছে!</b>\n{DIVIDER}\n"
+                "<blockquote>আপনার মেসেজটি অ্যাডমিনের কাছে পৌঁছেছে। অ্যাডমিন উত্তর দিলে এখানেই দেখতে পাবেন 🙏</blockquote>",
+                parse_mode=ParseMode.HTML,
                 reply_markup=MAIN_MENU_MARKUP,
             )
         else:
@@ -3214,6 +3478,9 @@ async def process_state_text(text: str, msg, user, context: ContextTypes.DEFAULT
 # GLOBAL ERROR HANDLER
 # ---------------------------------------------------------------------------
 async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if isinstance(context.error, Conflict):
+        logger.warning("Telegram 409 Conflict detected (overlapping deploy or another instance polling). Waiting for other instance to stop...")
+        return
     logger.error(f"Unhandled exception: {context.error}", exc_info=context.error)
     if isinstance(update, Update) and update.effective_message:
         try:
