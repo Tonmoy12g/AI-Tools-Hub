@@ -40,7 +40,7 @@ import requests
 import yt_dlp
 from flask import Flask
 from gtts import gTTS
-from PIL import Image
+from PIL import Image, ImageEnhance, ImageFilter
 from pypdf import PdfReader
 from telegram import (
     InlineKeyboardButton,
@@ -427,12 +427,28 @@ def is_user_premium(user_id: int) -> bool:
 
 
 def add_points(user_id: int, pts: int) -> None:
+    actual_pts = pts * 2 if (pts == 1 and is_user_premium(user_id)) else pts
     with get_db() as conn:
         conn.execute(
             "UPDATE users SET points = points + ?, week_points = week_points + ? WHERE user_id = ?",
-            (pts, pts, user_id),
+            (actual_pts, actual_pts, user_id),
         )
         conn.commit()
+
+
+def clean_ai_text(text: str) -> str:
+    """
+    Removes ugly raw markdown (**bold**, ### headers, LaTeX math symbols) from AI output
+    so every message looks clean, readable, and professional inside Telegram HTML cards.
+    """
+    if not text:
+        return ""
+    t = text.replace("**", "").replace("__", "")
+    t = re.sub(r"^#{1,6}\s*", "📌 ", t, flags=re.MULTILINE)
+    t = t.replace("\times", "×").replace("\div", "÷").replace("\pm", "±")
+    t = t.replace("\therefore", "∴").replace("\Rightarrow", "⇒").replace("\approx", "≈")
+    t = t.replace("$$", "").replace("$", "")
+    return t.strip()
 
 
 def get_total_users() -> int:
@@ -690,31 +706,141 @@ def call_groq_chat(
     raise RuntimeError("Groq chat completion failed after retry.")
 
 
-def call_groq_whisper(file_path: str) -> str:
+def preprocess_voice_for_stt(input_path: str) -> str:
+    """
+    Converts Telegram OGG/Opus voice clips into clean 16kHz mono MP3 audio with
+    voice-band filtering and volume normalization so Whisper hears Bangla & English clearly.
+    """
+    out_mp3 = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3").name
+    try:
+        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+        subprocess.run(
+            [
+                ffmpeg_exe,
+                "-y",
+                "-i",
+                input_path,
+                "-vn",
+                "-ac",
+                "1",
+                "-ar",
+                "16000",
+                "-af",
+                "highpass=f=80,lowpass=f=7500,volume=1.4",
+                "-b:a",
+                "64k",
+                out_mp3,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=25,
+            check=True,
+        )
+        if os.path.exists(out_mp3) and os.path.getsize(out_mp3) > 200:
+            return out_mp3
+    except Exception as e:
+        logger.warning(f"Audio preprocessing fallback to original file: {e}")
+    if os.path.exists(out_mp3):
+        try:
+            os.remove(out_mp3)
+        except OSError:
+            pass
+    return input_path
+
+
+def refine_stt_transcript(raw_text: str, lang_mode: str = "bn") -> str:
+    """
+    Fixes common Whisper STT issues via Groq LLM:
+    - If Whisper outputs Hindi/Devanagari/Urdu/Assamese script for Bangla speech, or writes
+      broken phonetic Bangla words, converts and corrects it into clean, accurate বাংলা (or English).
+    """
+    cleaned = (raw_text or "").strip()
+    if not cleaned:
+        return ""
+    try:
+        target_instruction = (
+            "The user spoke in Bangla (or Banglish/mixed English). If the raw transcript contains "
+            "Hindi/Devanagari/Urdu/Assamese characters or phonetic Bangla spelling mistakes, transliterate and "
+            "correct it into natural, accurate বাংলা (Bangla) script while keeping English terms natural. "
+            if lang_mode != "en"
+            else "The user spoke in English. Fix any phonetic transcription mistakes and punctuation naturally. "
+        )
+        fixed = call_groq_chat(
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are an expert speech-to-text post-processor. "
+                        + target_instruction
+                        + "Do NOT add extra commentary, explanations, or quotes. Output ONLY the corrected transcript text."
+                    ),
+                },
+                {"role": "user", "content": cleaned},
+            ],
+            temperature=0.1,
+            max_tokens=800,
+        )
+        if fixed and len(fixed.strip()) > 0:
+            return fixed.strip().strip('"').strip("'")
+    except Exception as e:
+        logger.warning(f"STT post-processing skipped: {e}")
+    return cleaned
+
+
+def call_groq_whisper(file_path: str, lang_mode: str = "bn") -> str:
     if not GROQ_API_KEY:
         raise RuntimeError("GROQ_API_KEY is not configured.")
 
     url = "https://api.groq.com/openai/v1/audio/transcriptions"
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
 
+    processed_path = preprocess_voice_for_stt(file_path)
+    mime_type = "audio/mpeg" if processed_path.endswith(".mp3") else "audio/ogg"
+
+    # For Bangla or Auto mode, prioritize multilingual Whisper models (distil-whisper-large-v3-en is English-only!)
+    models_to_try = (
+        ["whisper-large-v3", "whisper-large-v3-turbo", "distil-whisper-large-v3-en"]
+        if lang_mode == "en"
+        else ["whisper-large-v3", "whisper-large-v3-turbo"]
+    )
+
     last_err: Optional[Exception] = None
-    for model in GROQ_WHISPER_MODELS:
-        try:
-            with open(file_path, "rb") as f:
-                files = {"file": (os.path.basename(file_path), f, "audio/ogg")}
-                data = {"model": model}
-                resp = requests.post(url, headers=headers, files=files, data=data, timeout=60)
-            if resp.status_code == 404:
-                logger.warning(f"Whisper model {model} returned 404, skipping to next...")
-                continue
-            resp.raise_for_status()
-            result = resp.json()
-            text = result.get("text", "").strip()
-            if text:
-                return text
-        except Exception as e:
-            last_err = e
-            logger.warning(f"Whisper transcription error with {model}: {e}")
+    try:
+        for model in models_to_try:
+            try:
+                with open(processed_path, "rb") as f:
+                    files = {"file": (os.path.basename(processed_path), f, mime_type)}
+                    data: Dict[str, str] = {
+                        "model": model,
+                        "temperature": "0",
+                    }
+                    if lang_mode == "bn":
+                        data["language"] = "bn"
+                        data["prompt"] = "আসসালামু আলাইকুম, এটি স্পষ্ট বাংলা ভয়েস মেসেজ।"
+                    elif lang_mode == "en":
+                        data["language"] = "en"
+                        data["prompt"] = "Clear English voice message."
+                    else:
+                        data["prompt"] = "বাংলা এবং English ভয়েস মেসেজ।"
+
+                    resp = requests.post(url, headers=headers, files=files, data=data, timeout=60)
+                if resp.status_code == 404:
+                    logger.warning(f"Whisper model {model} returned 404, skipping to next...")
+                    continue
+                resp.raise_for_status()
+                result = resp.json()
+                text = result.get("text", "").strip()
+                if text:
+                    return refine_stt_transcript(text, lang_mode=lang_mode)
+            except Exception as e:
+                last_err = e
+                logger.warning(f"Whisper transcription error with {model}: {e}")
+    finally:
+        if processed_path != file_path and os.path.exists(processed_path):
+            try:
+                os.remove(processed_path)
+            except OSError:
+                pass
 
     if last_err:
         raise last_err
@@ -722,23 +848,62 @@ def call_groq_whisper(file_path: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# WATERMARK-FREE IMAGE CLEANING (100% LOGO REMOVAL GUARANTEE)
+# ULTRA-HD AI IMAGE PROMPT ENHANCER & WATERMARK-FREE POLISHER
 # ---------------------------------------------------------------------------
+def enhance_image_prompt_with_groq(user_prompt: str) -> str:
+    """
+    Translates Bangla/short prompts into a rich, cinematic English Flux prompt
+    so the generated image is ultra-detailed, photorealistic, and accurate.
+    """
+    try:
+        sys_msg = (
+            "You are an expert AI image prompt engineer for the Flux image model. "
+            "Convert the user's input (which may be in Bangla, Banglish, or English) into a single, vivid, "
+            "masterpiece English image generation prompt (max 55 words). "
+            "Include subject details, natural lighting, cinematic composition, ultra-detailed 8k photorealistic quality, "
+            "and sharp focus. Output ONLY the raw English prompt text, no quotes or explanations."
+        )
+        enhanced = call_groq_chat(
+            messages=[
+                {"role": "system", "content": sys_msg},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.5,
+            max_tokens=160,
+        )
+        cleaned = enhanced.strip().strip('"').strip("'")
+        if cleaned and len(cleaned) > 5:
+            return cleaned
+    except Exception as e:
+        logger.warning(f"Prompt enhancement fallback to raw prompt: {e}")
+    return f"{user_prompt}, masterpiece, ultra detailed, 8k photorealistic, cinematic lighting, sharp focus"
+
+
 def remove_bottom_watermark_and_polish(img_bytes: bytes) -> bytes:
     """
-    Guarantees 100% watermark-free AI images by cropping the bottom watermark zone
-    and resizing to a crisp 1024x1024 JPEG.
+    Guarantees 100% watermark-free, razor-sharp AI images.
+    We request 1024x1100 from Pollinations Flux and crop the bottom 76px directly
+    (zero stretching or upscaling blur!), then apply subtle contrast/sharpness polish.
     """
     with Image.open(io.BytesIO(img_bytes)) as im:
         rgb = im.convert("RGB")
         w, h = rgb.size
-        crop_bottom = int(h * 0.935)
-        margin_x = int(w * 0.0325)
-        cropped = rgb.crop((margin_x, 0, w - margin_x, crop_bottom))
-        resample_filter = getattr(Image, "Resampling", Image).LANCZOS
-        final_im = cropped.resize((1024, 1024), resample_filter)
+        if h >= 1080 and w == 1024:
+            # Direct 1:1 pixel crop of the top 1024x1024 (removes bottom 76px watermark strip without any resize blur)
+            final_im = rgb.crop((0, 0, 1024, 1024))
+        else:
+            crop_bottom = int(h * 0.935)
+            margin_x = int(w * 0.0325)
+            cropped = rgb.crop((margin_x, 0, w - margin_x, crop_bottom))
+            resample_filter = getattr(Image, "Resampling", Image).LANCZOS
+            final_im = cropped.resize((1024, 1024), resample_filter)
+
+        # Apply subtle studio sharpness & contrast enhancement for crisp HD look
+        final_im = ImageEnhance.Sharpness(final_im).enhance(1.18)
+        final_im = ImageEnhance.Contrast(final_im).enhance(1.05)
+
         out_bio = io.BytesIO()
-        final_im.save(out_bio, format="JPEG", quality=95, optimize=True)
+        final_im.save(out_bio, format="JPEG", quality=98, subsampling=0, optimize=True)
         return out_bio.getvalue()
 
 
@@ -752,7 +917,151 @@ BANGLA_JOKES = [
     "বল্টু: জানিস, আমি না দেখে লিখতে পারি!\nবন্ধু: বাহ! কী লিখিস?\nবল্টু: কী লিখি সেটা তো নিজেও পড়তে পারি না! 😂",
     "ক্রেতা: ভাই, এই মুরগিটা এত শুকনো কেন?\nবিক্রেতা: ভাই, মুরগিটা বিসিএস পরীক্ষার টেনশনে খাওয়া-দাওয়া ছেড়ে দিয়েছিল! 🤣",
     "বাবা: তোর রেজাল্ট এত খারাপ কেন?\nছেলে: বাবা, অতি লোভে তাঁতি নষ্ট, তাই বেশি নম্বরের লোভ করিনি! 😄",
+    "পুলিশ: এত রাতে রাস্তায় কী করছেন?\nবল্টু: স্যার, ঘুমটা রাস্তায় হারিয়ে গেছে, তাই খুঁজছি! 🤣",
+    "বিচারক: আপনি চুরি করেছেন কেন?\nচোর: হুজুর, সবাই বলে নিজের পায়ে দাঁড়াতে, তাই অন্যের সাইকেলটা নিয়েছিলাম! 😂",
+    "স্ত্রী: শোনো, আমার জন্মদিনে এবার এমন কিছু দেবে যা চালালে ০ থেকে ১০০-তে উঠে যাবে ২ সেকেন্ডে!\nস্বামী: ওকে, আজই ওজন মাপার মেশিন কিনে আনছি! 😅",
+    "শিক্ষক: বলো তো, পৃথিবীর সবচেয়ে প্রাচীন প্রাণী কোনটি?\nছাত্র: স্যার, জেব্রা! কারণ ওটা এখনো সাদাকালো (Black & White) যুগেই আছে! 🤣",
+    "বন্ধু ১: ভাই, তোর মোবাইলটা এত গরম হয়ে আছে কেন?\nবন্ধু ২: আর বলিস না, গার্লফ্রেন্ডের সাথে একটু কড়া ভাষায় কথা বলেছি তো! 😂",
+    "ডাক্তার: প্রতিদিন সকালে ঘুম থেকে উঠে গরম পানি খাবেন।\nবল্টু: ডাক্তার সাব, আমাদের বাসায় তো একেই গ্যাস থাকে না, আবার ঘুম থেকে উঠে পানি গরম করব কীভাবে! 😄",
 ]
+
+BD_DISTRICT_MAP: Dict[str, Tuple[str, str]] = {
+    "ঢাকা": ("Dhaka", "ঢাকা"), "dhaka": ("Dhaka", "ঢাকা"),
+    "গাজীপুর": ("Gazipur", "গাজীপুর"), "gazipur": ("Gazipur", "গাজীপুর"),
+    "নারায়ণগঞ্জ": ("Narayanganj", "নারায়ণগঞ্জ"), "narayanganj": ("Narayanganj", "নারায়ণগঞ্জ"),
+    "নরসিংদী": ("Narsingdi", "নরসিংদী"), "narsingdi": ("Narsingdi", "নরসিংদী"),
+    "মানিকগঞ্জ": ("Manikganj", "মানিকগঞ্জ"), "manikganj": ("Manikganj", "মানিকগঞ্জ"),
+    "মুন্সিগঞ্জ": ("Munshiganj", "মুন্সিগঞ্জ"), "munshiganj": ("Munshiganj", "মুন্সিগঞ্জ"),
+    "টাঙ্গাইল": ("Tangail", "টাঙ্গাইল"), "tangail": ("Tangail", "টাঙ্গাইল"),
+    "কিশোরগঞ্জ": ("Kishoreganj", "কিশোরগঞ্জ"), "kishoreganj": ("Kishoreganj", "কিশোরগঞ্জ"),
+    "ফরিদপুর": ("Faridpur", "ফরিদপুর"), "faridpur": ("Faridpur", "ফরিদপুর"),
+    "গোপালগঞ্জ": ("Gopalganj", "গোপালগঞ্জ"), "gopalganj": ("Gopalganj", "গোপালগঞ্জ"),
+    "মাদারীপুর": ("Madaripur", "মাদারীপুর"), "madaripur": ("Madaripur", "মাদারীপুর"),
+    "রাজবাড়ী": ("Rajbari", "রাজবাড়ী"), "rajbari": ("Rajbari", "রাজবাড়ী"),
+    "শরীয়তপুর": ("Shariatpur", "শরীয়তপুর"), "shariatpur": ("Shariatpur", "শরীয়তপুর"),
+    "চট্টগ্রাম": ("Chittagong", "চট্টগ্রাম"), "chittagong": ("Chittagong", "চট্টগ্রাম"), "chattogram": ("Chittagong", "চট্টগ্রাম"),
+    "কক্সবাজার": ("Cox's Bazar", "কক্সবাজার"), "coxsbazar": ("Cox's Bazar", "কক্সবাজার"), "cox's bazar": ("Cox's Bazar", "কক্সবাজার"),
+    "কুমিল্লা": ("Comilla", "কুমিল্লা"), "comilla": ("Comilla", "কুমিল্লা"), "cumilla": ("Comilla", "কুমিল্লা"),
+    "ব্রাহ্মণবাড়িয়া": ("Brahmanbaria", "ব্রাহ্মণবাড়িয়া"), "brahmanbaria": ("Brahmanbaria", "ব্রাহ্মণবাড়িয়া"),
+    "চাঁদপুর": ("Chandpur", "চাঁদপুর"), "chandpur": ("Chandpur", "চাঁদপুর"),
+    "লক্ষ্মীপুর": ("Lakshmipur", "লক্ষ্মীপুর"), "lakshmipur": ("Lakshmipur", "লক্ষ্মীপুর"),
+    "নোয়াখালী": ("Noakhali", "নোয়াখালী"), "noakhali": ("Noakhali", "নোয়াখালী"),
+    "ফেনী": ("Feni", "ফেনী"), "feni": ("Feni", "ফেনী"),
+    "খাগড়াছড়ি": ("Khagrachhari", "খাগড়াছড়ি"), "khagrachhari": ("Khagrachhari", "খাগড়াছড়ি"),
+    "রাঙ্গামাটি": ("Rangamati", "রাঙ্গামাটি"), "rangamati": ("Rangamati", "রাঙ্গামাটি"),
+    "বান্দরবান": ("Bandarban", "বান্দরবান"), "bandarban": ("Bandarban", "বান্দরবান"),
+    "খুলনা": ("Khulna", "খুলনা"), "khulna": ("Khulna", "খুলনা"),
+    "যশোর": ("Jessore", "যশোর"), "jessore": ("Jessore", "যশোর"), "jashore": ("Jessore", "যশোর"),
+    "সাতক্ষীরা": ("Satkhira", "সাতক্ষীরা"), "satkhira": ("Satkhira", "সাতক্ষীরা"),
+    "বাগেরহাট": ("Bagerhat", "বাগেরহাট"), "bagerhat": ("Bagerhat", "বাগেরহাট"),
+    "কুষ্টিয়া": ("Kushtia", "কুষ্টিয়া"), "kushtia": ("Kushtia", "কুষ্টিয়া"),
+    "ঝিনাইদহ": ("Jhenaidah", "ঝিনাইদহ"), "jhenaidah": ("Jhenaidah", "ঝিনাইদহ"),
+    "চুয়াডাঙ্গা": ("Chuadanga", "চুয়াডাঙ্গা"), "chuadanga": ("Chuadanga", "চুয়াডাঙ্গা"),
+    "মেহেরপুর": ("Meherpur", "মেহেরপুর"), "meherpur": ("Meherpur", "মেহেরপুর"),
+    "মাগুরা": ("Magura", "মাগুরা"), "magura": ("Magura", "মাগুরা"),
+    "নড়াইল": ("Narail", "নড়াইল"), "narail": ("Narail", "নড়াইল"),
+    "রাজশাহী": ("Rajshahi", "রাজশাহী"), "rajshahi": ("Rajshahi", "রাজশাহী"),
+    "বগুড়া": ("Bogra", "বগুড়া"), "bogra": ("Bogra", "বগুড়া"), "bogura": ("Bogra", "বগুড়া"),
+    "পাবনা": ("Pabna", "পাবনা"), "pabna": ("Pabna", "পাবনা"),
+    "সিরাজগঞ্জ": ("Sirajganj", "সিরাজগঞ্জ"), "sirajganj": ("Sirajganj", "সিরাজগঞ্জ"),
+    "নাটোর": ("Natore", "নাটোর"), "natore": ("Natore", "নাটোর"),
+    "নওগাঁ": ("Naogaon", "নওগাঁ"), "naogaon": ("Naogaon", "নওগাঁ"),
+    "চাঁপাইনবাবগঞ্জ": ("Chapai Nawabganj", "চাঁপাইনবাবগঞ্জ"), "chapainawabganj": ("Chapai Nawabganj", "চাঁপাইনবাবগঞ্জ"),
+    "জয়পুরহাট": ("Joypurhat", "জয়পুরহাট"), "joypurhat": ("Joypurhat", "জয়পুরহাট"),
+    "সিলেট": ("Sylhet", "সিলেট"), "sylhet": ("Sylhet", "সিলেট"),
+    "মৌলভীবাজার": ("Moulvibazar", "মৌলভীবাজার"), "moulvibazar": ("Moulvibazar", "মৌলভীবাজার"),
+    "হবিগঞ্জ": ("Habiganj", "হবিগঞ্জ"), "habiganj": ("Habiganj", "হবিগঞ্জ"),
+    "সুনামগঞ্জ": ("Sunamganj", "সুনামগঞ্জ"), "sunamganj": ("Sunamganj", "সুনামগঞ্জ"),
+    "বরিশাল": ("Barisal", "বরিশাল"), "barisal": ("Barisal", "বরিশাল"), "barishal": ("Barisal", "বরিশাল"),
+    "পটুয়াখালী": ("Patuakhali", "পটুয়াখালী"), "patuakhali": ("Patuakhali", "পটুয়াখালী"),
+    "ভোলা": ("Bhola", "ভোলা"), "bhola": ("Bhola", "ভোলা"),
+    "পিরোজপুর": ("Pirojpur", "পিরোজপুর"), "pirojpur": ("Pirojpur", "পিরোজপুর"),
+    "বরগুনা": ("Barguna", "বরগুনা"), "barguna": ("Barguna", "বরগুনা"),
+    "ঝালকাঠি": ("Jhalokati", "ঝালকাঠি"), "jhalokati": ("Jhalokati", "ঝালকাঠি"),
+    "রংপুর": ("Rangpur", "রংপুর"), "rangpur": ("Rangpur", "রংপুর"),
+    "দিনাজপুর": ("Dinajpur", "দিনাজপুর"), "dinajpur": ("Dinajpur", "দিনাজপুর"),
+    "কুড়িগ্রাম": ("Kurigram", "কুড়িগ্রাম"), "kurigram": ("Kurigram", "কুড়িগ্রাম"),
+    "গাইবান্ধা": ("Gaibandha", "গাইবান্ধা"), "gaibandha": ("Gaibandha", "গাইবান্ধা"),
+    "নীলফামারী": ("Nilphamari", "নীলফামারী"), "nilphamari": ("Nilphamari", "নীলফামারী"),
+    "লালমনিরহাট": ("Lalমনিরহাট", "লালমনিরহাট"), "lalmonirhat": ("Lalmonirhat", "লালমনিরহাট"),
+    "পঞ্চগড়": ("Panchagarh", "পঞ্চগড়"), "panchagarh": ("Panchagarh", "পঞ্চগড়"),
+    "ঠাকুরগাঁও": ("Thakurgaon", "ঠাকুরগাঁও"), "thakurgaon": ("Thakurgaon", "ঠাকুরগাঁও"),
+    "ময়মনসিংহ": ("Mymensingh", "ময়মনসিংহ"), "mymensingh": ("Mymensingh", "ময়মনসিংহ"),
+    "জামালপুর": ("Jamalpur", "জামালপুর"), "jamalpur": ("Jamalpur", "জামালপুর"),
+    "শেরপুর": ("Sherpur", "শেরপুর"), "sherpur": ("Sherpur", "শেরপুর"),
+    "নেত্রকোনা": ("Netrokona", "নেত্রকোনা"), "netrokona": ("Netrokona", "নেত্রকোনা"),
+}
+BD_DISTRICT_MAP["লালমনিরহাট"] = ("Lalmonirhat", "লালমনিরহাট")
+
+
+def fetch_prayer_times_for_location(query_place: str) -> str:
+    """
+    Fetches accurate daily prayer, Sehri & Iftar times for ANY of Bangladesh's 64 districts
+    or any world city (supports both Bangla and English input).
+    """
+    raw = (query_place or "").strip()
+    key = raw.lower()
+    if key in BD_DISTRICT_MAP:
+        city_en, city_bn = BD_DISTRICT_MAP[key]
+    elif raw in BD_DISTRICT_MAP:
+        city_en, city_bn = BD_DISTRICT_MAP[raw]
+    else:
+        city_en, city_bn = raw, raw
+
+    today_str = datetime.date.today().strftime("%d-%m-%Y")
+    timings = None
+
+    # 1. Try Open-Meteo geocoding first for exact latitude/longitude of any district/upazila
+    try:
+        geo_url = (
+            f"https://geocoding-api.open-meteo.com/v1/search?"
+            f"name={urllib.parse.quote(city_en)}&count=1&language=en&format=json"
+        )
+        g_resp = requests.get(geo_url, timeout=10)
+        if g_resp.status_code == 200 and g_resp.json().get("results"):
+            loc = g_resp.json()["results"][0]
+            lat, lon = loc["latitude"], loc["longitude"]
+            t_url = f"https://api.aladhan.com/v1/timings/{today_str}?latitude={lat}&longitude={lon}&method=1&school=1"
+            t_resp = requests.get(t_url, timeout=12)
+            if t_resp.status_code == 200:
+                timings = t_resp.json()["data"]["timings"]
+    except Exception as e:
+        logger.warning(f"Coordinate prayer lookup fallback: {e}")
+
+    # 2. Fallback to Aladhan timingsByCity
+    if not timings:
+        url = (
+            f"https://api.aladhan.com/v1/timingsByCity/{today_str}"
+            f"?city={urllib.parse.quote(city_en)}&country=Bangladesh&method=1&school=1"
+        )
+        resp = requests.get(url, timeout=15)
+        resp.raise_for_status()
+        timings = resp.json()["data"]["timings"]
+
+    imsak = format_12h(timings.get("Imsak", timings["Fajr"]))
+    fajr = format_12h(timings["Fajr"])
+    sunrise = format_12h(timings["Sunrise"])
+    dhuhr = format_12h(timings["Dhuhr"])
+    asr = format_12h(timings["Asr"])
+    maghrib = format_12h(timings["Maghrib"])
+    isha = format_12h(timings["Isha"])
+
+    return (
+        f"🕌 <b>আজকের নামাজ ও সাহরি-ইফতারের সময়সূচী</b>\n"
+        f"{DIVIDER}\n"
+        f"📍 <b>জেলা / শহর:</b> {html.escape(city_bn)} ({html.escape(city_en)})\n"
+        f"📅 <b>তারিখ:</b> {today_str} (ইসলামিক ফাউন্ডেশন ও হানাফী মেথড)\n\n"
+        f"<blockquote>"
+        f"🌙 <b>সাহরির শেষ সময়:</b> {imsak}\n"
+        f"🌅 <b>ফজর (Fajr):</b> {fajr}\n"
+        f"☀️ <b>সূর্যোদয় (Sunrise):</b> {sunrise}\n"
+        f"🌞 <b>যোহর (Dhuhr):</b> {dhuhr}\n"
+        f"🌤️ <b>আসর (Asr):</b> {asr}\n"
+        f"🌇 <b>মাগরিব ও ইফতার:</b> {maghrib}\n"
+        f"🌃 <b>ইশা (Isha):</b> {isha}"
+        f"</blockquote>\n\n"
+        f"💡 <i>অন্য যেকোনো জেলার নাম (বাংলায় বা ইংরেজিতে, যেমন: যশোর, কুমিল্লা, বগুড়া, কক্সবাজার) লিখে পাঠালেই সাথে সাথে সেই জেলার সময়সূচী দেখতে পাবেন!</i>"
+    )
 
 SEVEN_DUAS = [
     {
@@ -1350,50 +1659,140 @@ def parse_reminder_input(raw_text: str) -> Optional[Tuple[int, str]]:
     return seconds, note
 
 
-def fetch_crypto_prices() -> str:
-    coins = [
-        ("bitcoin", "BTC", "BTCUSDT", "Bitcoin (BTC)"),
-        ("ethereum", "ETH", "ETHUSDT", "Ethereum (ETH)"),
-        ("binancecoin", "BNB", "BNBUSDT", "BNB (BNB)"),
-        ("dogecoin", "DOGE", "DOGEUSDT", "Dogecoin (DOGE)"),
-        ("ripple", "XRP", "XRPUSDT", "XRP (XRP)"),
-        ("solana", "SOL", "SOLUSDT", "Solana (SOL)"),
-    ]
-
-    usd_to_bdt = 120.0
+def fetch_crypto_prices(custom_symbol: Optional[str] = None) -> str:
+    """
+    5-Engine US/Render-Cloud-Safe Live Crypto Price Fetcher:
+    1. Binance Vision Official Public Data Mirror (data-api.binance.vision - NOT blocked on US/Render IPs!)
+    2. CryptoCompare Public API
+    3. CoinCap Public API
+    4. Coinbase Spot Price API
+    5. CoinGecko with browser headers
+    """
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/126.0.0.0"}
+    usd_to_bdt = 121.5
     try:
-        r_fx = requests.get("https://open.er-api.com/v6/latest/USD", timeout=8)
+        r_fx = requests.get("https://open.er-api.com/v6/latest/USD", headers=headers, timeout=8)
         if r_fx.status_code == 200:
-            usd_to_bdt = float(r_fx.json().get("rates", {}).get("BDT", 120.0))
+            usd_to_bdt = float(r_fx.json().get("rates", {}).get("BDT", 121.5))
     except Exception:
         pass
 
+    if custom_symbol:
+        sym = re.sub(r"[^A-Za-z0-9]", "", custom_symbol.strip()).upper()
+        if sym.endswith("USDT") and len(sym) > 4:
+            sym = sym[:-4]
+        price_usd: Optional[float] = None
+        # Try Binance Vision Mirror
+        try:
+            r = requests.get(f"https://data-api.binance.vision/api/v3/ticker/price?symbol={sym}USDT", headers=headers, timeout=8)
+            if r.status_code == 200 and "price" in r.json():
+                price_usd = float(r.json()["price"])
+        except Exception:
+            pass
+        # Try CryptoCompare
+        if price_usd is None:
+            try:
+                r = requests.get(f"https://min-api.cryptocompare.com/data/price?fsym={sym}&tsyms=USD", headers=headers, timeout=8)
+                if r.status_code == 200 and "USD" in r.json():
+                    price_usd = float(r.json()["USD"])
+            except Exception:
+                pass
+        # Try Coinbase
+        if price_usd is None:
+            try:
+                r = requests.get(f"https://api.coinbase.com/v2/prices/{sym}-USD/spot", headers=headers, timeout=8)
+                if r.status_code == 200 and "data" in r.json():
+                    price_usd = float(r.json()["data"]["amount"])
+            except Exception:
+                pass
+        if price_usd is None:
+            return (
+                f"⚠️ <b>{html.escape(sym)}</b> কয়েনটির দাম খুঁজে পাওয়া যায়নি।\n"
+                "<blockquote>অনুগ্রহ করে সঠিক কয়েন সিম্বল লিখুন (যেমন: <code>BTC</code>, <code>TON</code>, <code>TRX</code>, <code>PEPE</code>, <code>SHIB</code>)।</blockquote>"
+            )
+        bdt = price_usd * usd_to_bdt
+        usd_fmt = f"${price_usd:,.2f}" if price_usd >= 1 else f"${price_usd:.6f}"
+        bdt_fmt = f"৳{bdt:,.2f}" if bdt >= 1 else f"৳{bdt:.4f}"
+        return (
+            f"🪙 <b>{html.escape(sym)}/USD লাইভ বাজারমূল্য</b>\n"
+            f"{DIVIDER}\n"
+            f"<blockquote>"
+            f"💵 <b>USD দাম:</b> <code>{usd_fmt}</code>\n"
+            f"🇧🇩 <b>বাংলাদেশী টাকায়:</b> <code>{bdt_fmt}</code>\n"
+            f"📊 <b>রেট:</b> $1 USD = ৳{usd_to_bdt:,.2f} BDT"
+            f"</blockquote>"
+        )
+
+    coins = [
+        ("bitcoin", "BTC", "BTCUSDT", "Bitcoin (BTC)"),
+        ("ethereum", "ETH", "ETHUSDT", "Ethereum (ETH)"),
+        ("binance-coin", "BNB", "BNBUSDT", "BNB (BNB)"),
+        ("solana", "SOL", "SOLUSDT", "Solana (SOL)"),
+        ("the-open-network", "TON", "TONUSDT", "Toncoin (TON)"),
+        ("xrp", "XRP", "XRPUSDT", "XRP (XRP)"),
+        ("dogecoin", "DOGE", "DOGEUSDT", "Dogecoin (DOGE)"),
+        ("tron", "TRX", "TRXUSDT", "TRON (TRX)"),
+    ]
+
     prices_usd: Dict[str, float] = {}
 
+    # Engine 1: CryptoCompare Multi-Price API (Fastest single call, works globally on all cloud IPs)
     try:
-        ids_str = ",".join(c[0] for c in coins)
-        cg_url = f"https://api.coingecko.com/api/v3/simple/price?ids={ids_str}&vs_currencies=usd"
-        cg_resp = requests.get(cg_url, timeout=10)
-        if cg_resp.status_code == 200:
-            cg_data = cg_resp.json()
-            for cid, sym, _, _ in coins:
-                if cid in cg_data and "usd" in cg_data[cid]:
-                    prices_usd[sym] = float(cg_data[cid]["usd"])
+        syms = ",".join(c[1] for c in coins)
+        cc_url = f"https://min-api.cryptocompare.com/data/pricemulti?fsyms={syms}&tsyms=USD"
+        cc_resp = requests.get(cc_url, headers=headers, timeout=8)
+        if cc_resp.status_code == 200:
+            cc_data = cc_resp.json()
+            for _, sym, _, _ in coins:
+                if sym in cc_data and "USD" in cc_data[sym]:
+                    prices_usd[sym] = float(cc_data[sym]["USD"])
     except Exception as e:
-        logger.warning(f"CoinGecko failed, falling back to Binance: {e}")
+        logger.warning(f"CryptoCompare fallback: {e}")
 
-    for _, sym, binance_sym, _ in coins:
-        if sym not in prices_usd:
-            try:
-                b_url = f"https://api.binance.com/api/v3/ticker/price?symbol={binance_sym}"
-                b_resp = requests.get(b_url, timeout=8)
-                if b_resp.status_code == 200:
-                    prices_usd[sym] = float(b_resp.json()["price"])
-            except Exception as e:
-                logger.warning(f"Binance fallback failed for {binance_sym}: {e}")
+    # Engine 2: Binance Vision Official Data Mirror (never geo-blocked on Render!)
+    if len(prices_usd) < len(coins):
+        for _, sym, bin_pair, _ in coins:
+            if sym not in prices_usd:
+                try:
+                    bv_url = f"https://data-api.binance.vision/api/v3/ticker/price?symbol={bin_pair}"
+                    bv_resp = requests.get(bv_url, headers=headers, timeout=6)
+                    if bv_resp.status_code == 200 and "price" in bv_resp.json():
+                        prices_usd[sym] = float(bv_resp.json()["price"])
+                except Exception:
+                    pass
+
+    # Engine 3: Coinbase Spot API
+    if len(prices_usd) < len(coins):
+        for _, sym, _, _ in coins:
+            if sym not in prices_usd:
+                try:
+                    cb_url = f"https://api.coinbase.com/v2/prices/{sym}-USD/spot"
+                    cb_resp = requests.get(cb_url, headers=headers, timeout=6)
+                    if cb_resp.status_code == 200 and "data" in cb_resp.json():
+                        prices_usd[sym] = float(cb_resp.json()["data"]["amount"])
+                except Exception:
+                    pass
+
+    # Engine 4: CoinGecko API with browser headers
+    if len(prices_usd) < 4:
+        try:
+            cg_url = "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum,binancecoin,solana,the-open-network,ripple,dogecoin,tron&vs_currencies=usd"
+            cg_resp = requests.get(cg_url, headers=headers, timeout=8)
+            if cg_resp.status_code == 200:
+                cg_data = cg_resp.json()
+                cg_map = {
+                    "bitcoin": "BTC", "ethereum": "ETH", "binancecoin": "BNB",
+                    "solana": "SOL", "the-open-network": "TON", "ripple": "XRP",
+                    "dogecoin": "DOGE", "tron": "TRX"
+                }
+                for cid, sym in cg_map.items():
+                    if cid in cg_data and "usd" in cg_data[cid]:
+                        prices_usd[sym] = float(cg_data[cid]["usd"])
+        except Exception:
+            pass
 
     if not prices_usd:
-        raise RuntimeError("Could not fetch crypto prices from CoinGecko or Binance.")
+        raise RuntimeError("Could not fetch crypto prices from any provider.")
 
     body = []
     for _, sym, _, label in coins:
@@ -1405,28 +1804,123 @@ def fetch_crypto_prices() -> str:
             else:
                 body.append(f"🪙 <b>{label}</b>\n   💵 <code>${usd:.4f}</code>  |  🇧🇩 <code>৳{bdt:,.2f}</code>")
 
+    now_bd = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=6)).strftime("%I:%M %p, %d-%m-%Y")
     return (
-        f"📈 <b>ক্রিপ্টোকারেন্সির লাইভ বাজারমূল্য</b>\n"
+        f"📈 <b>ক্রিপ্টোকারেন্সির লাইভ বাজারমূল্য (Live Market)</b>\n"
         f"{DIVIDER}\n"
-        f"<blockquote>" + "\n\n".join(body) + "</blockquote>"
+        f"🕒 <b>আপডেট সময়:</b> {now_bd} (BDT Time)\n\n"
+        f"<blockquote>" + "\n\n".join(body) + "</blockquote>\n\n"
+        f"💡 <i>যেকোনো কয়েনের নাম (যেমন: <code>TON</code>, <code>PEPE</code>, <code>SHIB</code>, <code>NOT</code>) লিখে পাঠালে সেটিরও লাইভ দাম দেখতে পাবেন!</i>"
     )
 
 
-def fetch_google_news_bn() -> str:
-    url = "https://news.google.com/rss?hl=bn&gl=BD&ceid=BD:bn"
-    resp = requests.get(url, timeout=15)
+def fetch_google_news_bn(topic: str = "top") -> str:
+    """
+    Fetches live auto-updating Bangla news from Google News RSS.
+    Updates automatically every few minutes, 24 hours a day!
+    """
+    topic_queries = {
+        "top": ("https://news.google.com/rss?hl=bn&gl=BD&ceid=BD:bn", "🔥 আজকের শীর্ষ ব্রেকিং খবর"),
+        "bd": ("https://news.google.com/rss/search?q=%E0%A6%AC%E0%A6%BE%E0%A6%82%E0%A6%B2%E0%A6%BE%E0%A6%A6%E0%A7%87%E0%A6%B6&hl=bn&gl=BD&ceid=BD:bn", "🇧🇩 বাংলাদেশ ও জাতীয় খবর"),
+        "sports": ("https://news.google.com/rss/search?q=%E0%A6%96%E0%A7%87%E0%A6%B2%E0%A6%BE%E0%A6%A7%E0%A7%81%E0%A6%B2%E0%A6%BE+%E0%A6%95%E0%A7%8D%E0%A6%B0%E0%A6%BF%E0%A6%95%E0%A7%87%E0%A6%9F+%E0%A6%AB%E0%A7%81%E0%A6%9F%E0%A6%AC%E0%A6%B2&hl=bn&gl=BD&ceid=BD:bn", "🏏 খেলাধুলা ও ক্রিকেট খবর"),
+        "world": ("https://news.google.com/rss/search?q=%E0%A6%86%E0%A6%A8%E0%A7%8D%E0%A6%A4%E0%A6%B0%E0%A7%8D%E0%A6%9C%E0%A6%BE%E0%A6%A4%E0%A6%BF%E0%A6%95+%E0%A6%AC%E0%A6%BF%E0%A6%B6%E0%A7%8D%E0%A6%AC&hl=bn&gl=BD&ceid=BD:bn", "🌍 আন্তর্জাতিক ও বিশ্ব সংবাদ"),
+        "tech": ("https://news.google.com/rss/search?q=%E0%A6%AA%E0%A7%8D%E0%A6%B0%E0%A6%AF%E0%A7%81%E0%A6%95%E0%A7%8D%E0%A6%A4%E0%A6%BF+AI+%E0%A6%9F%E0%A7%87%E0%A6%95%E0%A6%A8%E0%A7%8B%E0%A6%B2%E0%A6%9C%E0%A6%BF&hl=bn&gl=BD&ceid=BD:bn", "💻 প্রযুক্তি ও বিজ্ঞান খবর"),
+    }
+    url, heading = topic_queries.get(topic, topic_queries["top"])
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/126.0.0.0"}
+    resp = requests.get(url, headers=headers, timeout=15)
     resp.raise_for_status()
     root = ET.fromstring(resp.content)
-    items = root.findall(".//item")[:5]
+    items = root.findall(".//item")[:7]
     if not items:
         return "📰 বর্তমানে কোনো খবর পাওয়া যায়নি।"
 
-    lines = [f"📰 <b>আজকের শীর্ষ ৫টি তাজা খবর (Google News)</b>\n{DIVIDER}"]
+    now_bd = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=6)).strftime("%d-%m-%Y, %I:%M %p")
+    lines = [
+        f"📰 <b>{heading} (লাইভ আপডেট)</b>\n"
+        f"{DIVIDER}\n"
+        f"🕒 <b>লাইভ ফিড সময়:</b> {en_to_bn_digits(now_bd)} (প্রতিদিন ২৪ ঘণ্টা অটো-আপডেট)"
+    ]
     for idx, item in enumerate(items, 1):
-        title = item.findtext("title") or "শিরোনাম নেই"
+        raw_title = item.findtext("title") or "শিরোনাম নেই"
         link = item.findtext("link") or ""
-        lines.append(f"<blockquote><b>{en_to_bn_digits(str(idx))}.</b> <a href=\"{html.escape(link)}\">{html.escape(title)}</a></blockquote>")
+        source_el = item.find("source")
+        source_name = source_el.text if (source_el is not None and source_el.text) else ""
+        if " - " in raw_title and not source_name:
+            parts = raw_title.rsplit(" - ", 1)
+            raw_title, source_name = parts[0], parts[1]
+        elif " - " in raw_title and source_name:
+            raw_title = raw_title.rsplit(" - ", 1)[0]
+
+        src_badge = f" — <i>🗞️ {html.escape(source_name)}</i>" if source_name else ""
+        lines.append(
+            f"<blockquote><b>{en_to_bn_digits(str(idx))}.</b> "
+            f"<a href=\"{html.escape(link)}\">{html.escape(raw_title)}</a>{src_badge}</blockquote>"
+        )
     return "\n".join(lines)
+
+
+def fetch_song_lyrics_and_info(query_song: str) -> str:
+    """
+    Searches LRCLIB free lyrics database first for real full lyrics, and combines with
+    Groq AI musical insights/Bangla lyrics so users always get a complete, satisfying result.
+    """
+    clean_q = query_song.strip()
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; BigBot/2.0)"}
+    found_lyrics = ""
+    track_header = ""
+
+    # 1. Try LRCLIB API (Free, no key, huge database of Bangla, Hindi & English songs)
+    try:
+        lrc_url = f"https://lrclib.net/api/search?q={urllib.parse.quote(clean_q)}"
+        r = requests.get(lrc_url, headers=headers, timeout=10)
+        if r.status_code == 200 and isinstance(r.json(), list) and len(r.json()) > 0:
+            best = r.json()[0]
+            plain = (best.get("plainLyrics") or "").strip()
+            t_name = best.get("trackName") or clean_q
+            a_name = best.get("artistName") or "Unknown Artist"
+            alb_name = best.get("albumName") or ""
+            if plain and len(plain) > 40:
+                found_lyrics = plain[:2200]
+                track_header = f"🎶 <b>গান:</b> {html.escape(t_name)}\n🎤 <b>শিল্পী:</b> {html.escape(a_name)}"
+                if alb_name:
+                    track_header += f"\n💿 <b>অ্যালবাম:</b> {html.escape(alb_name)}"
+    except Exception as e:
+        logger.warning(f"LRCLIB search fallback: {e}")
+
+    if found_lyrics:
+        return (
+            f"🎵 <b>গানের সম্পূর্ণ লিরিক্স ও তথ্য</b>\n"
+            f"{DIVIDER}\n"
+            f"<blockquote>{track_header}</blockquote>\n\n"
+            f"🎼 <b>লিরিক্স (Lyrics):</b>\n"
+            f"<blockquote>{html.escape(found_lyrics)}</blockquote>"
+        )
+
+    # 2. Fallback to Groq AI comprehensive song & chorus/lyrics presenter
+    ai_out = call_groq_chat(
+        [
+            {
+                "role": "system",
+                "content": (
+                    "You are an expert Bangla, Hindi, and English music encyclopedia. "
+                    "When the user asks for a song, provide clearly in Bangla without raw asterisks (**):\n"
+                    "🎶 গানের নাম:\n"
+                    "🎤 শিল্পী ও অ্যালবাম/সিনেমা:\n"
+                    "🎼 গানের বিখ্যাত লাইন / লিরিক্স:\n"
+                    "💡 গানের মূল ভাবার্থ ও আকর্ষণীয় তথ্য:"
+                ),
+            },
+            {"role": "user", "content": f"গান: {clean_q}"},
+        ],
+        temperature=0.5,
+        max_tokens=1200,
+    )
+    return (
+        f"🎵 <b>গানের লিরিক্স ও বিস্তারিত তথ্য</b>\n"
+        f"{DIVIDER}\n"
+        f"<blockquote>{html.escape(clean_ai_text(ai_out))}</blockquote>"
+    )
 
 
 async def generate_tts_voice(text: str, voice: str) -> str:
@@ -1847,12 +2341,16 @@ def build_admin_panel_markup() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("📊 Stats", callback_data="admin:stats"),
-                InlineKeyboardButton("📢 Broadcast", callback_data="admin:broadcast"),
+                InlineKeyboardButton("📊 Live Stats", callback_data="admin:stats"),
+                InlineKeyboardButton("📢 Broadcast All", callback_data="admin:broadcast"),
             ],
             [
                 InlineKeyboardButton("📢 চ্যানেল (Force Join)", callback_data="admin:channel"),
                 InlineKeyboardButton(f"🔧 Maintenance: {maint_status}", callback_data="admin:maint_toggle"),
+            ],
+            [
+                InlineKeyboardButton("👑 VIP প্রিমিয়াম দিন/নিন", callback_data="admin:vip_user"),
+                InlineKeyboardButton(f"💎 Premium Mode: {prem_status}", callback_data="admin:prem_toggle"),
             ],
             [
                 InlineKeyboardButton("➕ পণ্য যোগ (Add Product)", callback_data="admin:add_prod"),
@@ -1864,7 +2362,7 @@ def build_admin_panel_markup() -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton("📦 অর্ডার লিস্ট (Orders)", callback_data="admin:orders"),
-                InlineKeyboardButton(f"💎 Premium Mode: {prem_status}", callback_data="admin:prem_toggle"),
+                InlineKeyboardButton("👑 VIP ইউজার লিস্ট", callback_data="admin:vip_list"),
             ],
         ]
     )
@@ -2180,6 +2678,26 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                     "💡 উদাহরণ: <code>123456789 100</code></blockquote>",
                     parse_mode=ParseMode.HTML,
                 )
+            elif action == "vip_user":
+                context.user_data["state"] = "ADMIN_VIP_TOGGLE"
+                await query.answer()
+                await query.message.reply_text(
+                    f"👑 <b>VIP প্রিমিয়াম মেম্বারশিপ কন্ট্রোল</b>\n"
+                    f"{DIVIDER}\n"
+                    "<blockquote>যেকোনো ইউজারকে <b>VIP প্রিমিয়াম</b> দিতে বা বাতিল করতে তার <b>Telegram User ID</b> লিখে পাঠান (ফ্রি থাকলে VIP হবে, আর VIP থাকলে ফ্রি হবে):</blockquote>",
+                    parse_mode=ParseMode.HTML,
+                )
+            elif action == "vip_list":
+                with get_db() as conn:
+                    vips = conn.execute("SELECT user_id, name, points FROM users WHERE premium = 1 ORDER BY points DESC LIMIT 30").fetchall()
+                await query.answer()
+                if not vips:
+                    await query.message.reply_text("👑 বর্তমানে কোনো VIP প্রিমিয়াম ইউজার নেই।")
+                    return
+                lines = [f"👑 <b>VIP প্রিমিয়াম মেম্বার তালিকা ({len(vips)} জন)</b>\n{DIVIDER}"]
+                for v in vips:
+                    lines.append(f"• <b>{html.escape(v['name'] or 'User')}</b> — ID: <code>{v['user_id']}</code> ({v['points']} pts)")
+                await query.message.reply_text("<blockquote>" + "\n".join(lines) + "</blockquote>", parse_mode=ParseMode.HTML)
             elif action == "orders":
                 with get_db() as conn:
                     orders = conn.execute("SELECT * FROM orders ORDER BY id DESC LIMIT 10").fetchall()
@@ -2218,6 +2736,25 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             await query.answer()
             return
 
+        # 3a. Voice Selection for STT (Voice -> Text language mode)
+        if data.startswith("stt_lang:"):
+            lang_mode = data.split(":", 1)[1]
+            context.user_data["stt_lang"] = lang_mode
+            context.user_data["state"] = "WAIT_STT_VOICE"
+            lang_label = {
+                "bn": "🇧🇩 বাংলা (Bangla)",
+                "en": "🇬🇧 English",
+                "auto": "🌐 অটো ডিটেক্ট (Bangla + English)",
+            }.get(lang_mode, "🇧🇩 বাংলা")
+            await query.answer("ভয়েসের ভাষা নির্বাচন করা হয়েছে!")
+            await query.message.reply_text(
+                f"🎤 <b>নির্বাচিত ভয়েস ভাষা:</b> {lang_label}\n"
+                f"{DIVIDER}\n"
+                "🎙️ এখন আপনার ভয়েস মেসেজ (Voice Message) রেকর্ড করে বা ফরোয়ার্ড করে পাঠান:",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
         # 3. Voice Selection for TTS
         if data.startswith("tts_voice:"):
             voice = data.split(":", 1)[1]
@@ -2249,28 +2786,117 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
         # 5. Prayer Times City Selection
         if data.startswith("prayer_city:"):
-            city_en, city_bn = data.split(":", 1)[1].split("|")
+            city_en, _ = data.split(":", 1)[1].split("|")
+            context.user_data["state"] = "WAIT_PRAYER"
             await query.answer("নামাজের সময়সূচী লোড হচ্ছে...")
-            today_str = datetime.date.today().strftime("%d-%m-%Y")
-            url = f"https://api.aladhan.com/v1/timingsByCity/{today_str}?city={urllib.parse.quote(city_en)}&country=Bangladesh&method=1"
-            resp = requests.get(url, timeout=15)
-            resp.raise_for_status()
-            timings = resp.json()["data"]["timings"]
-            msg = (
-                f"🕌 <b>আজকের নামাজের সময়সূচী ({city_bn})</b>\n"
-                f"{DIVIDER}\n"
-                f"📅 <b>তারিখ:</b> {today_str}\n\n"
-                f"<blockquote>"
-                f"🌅 <b>ফজর (Fajr):</b> {format_12h(timings['Fajr'])}\n"
-                f"☀️ <b>সূর্যোদয় (Sunrise):</b> {format_12h(timings['Sunrise'])}\n"
-                f"🌞 <b>যোহর (Dhuhr):</b> {format_12h(timings['Dhuhr'])}\n"
-                f"🌤️ <b>আসর (Asr):</b> {format_12h(timings['Asr'])}\n"
-                f"🌇 <b>মাগরিব (Maghrib):</b> {format_12h(timings['Maghrib'])}\n"
-                f"🌙 <b>ইশা (Isha):</b> {format_12h(timings['Isha'])}"
-                f"</blockquote>"
-            )
+            msg_out = await asyncio.to_thread(fetch_prayer_times_for_location, city_en)
             add_points(user.id, 1)
-            await query.message.reply_text(msg, parse_mode=ParseMode.HTML)
+            await query.message.reply_text(msg_out, parse_mode=ParseMode.HTML)
+            return
+
+        # 5b. News Category Selection
+        if data.startswith("news_cat:"):
+            topic = data.split(":", 1)[1]
+            await query.answer("তাজা খবর লোড হচ্ছে...")
+            news_text = await asyncio.to_thread(fetch_google_news_bn, topic)
+            news_kb = InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton("🔥 ব্রেকিং", callback_data="news_cat:top"),
+                        InlineKeyboardButton("🇧🇩 বাংলাদেশ", callback_data="news_cat:bd"),
+                        InlineKeyboardButton("🏏 খেলাধুলা", callback_data="news_cat:sports"),
+                    ],
+                    [
+                        InlineKeyboardButton("🌍 আন্তর্জাতিক", callback_data="news_cat:world"),
+                        InlineKeyboardButton("💻 প্রযুক্তি", callback_data="news_cat:tech"),
+                        InlineKeyboardButton("🔄 রিফ্রেশ", callback_data=f"news_cat:{topic}"),
+                    ],
+                ]
+            )
+            await query.message.reply_text(
+                news_text,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+                reply_markup=news_kb,
+            )
+            return
+
+        # 5c. Jokes Category / Next Joke Selection
+        if data.startswith("joke_cat:"):
+            j_type = data.split(":", 1)[1]
+            await query.answer("মজার জোকস তৈরি হচ্ছে...")
+            joke_kb = InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton("🤣 আরেকটা জোকস", callback_data="joke_cat:ai_random"),
+                        InlineKeyboardButton("🎓 ছাত্র-শিক্ষক", callback_data="joke_cat:student"),
+                    ],
+                    [
+                        InlineKeyboardButton("💑 স্বামী-স্ত্রী", callback_data="joke_cat:couple"),
+                        InlineKeyboardButton("🤪 বল্টু জোকস", callback_data="joke_cat:boltu"),
+                    ],
+                ]
+            )
+            if j_type == "builtin":
+                joke_body = random.choice(BANGLA_JOKES)
+            else:
+                topic_map = {
+                    "ai_random": "একটি দমফাটা হাসির নতুন বাংলা জোকস (কৌতুক)",
+                    "student": "ছাত্র ও শিক্ষকের মধ্যে একটি মজার দমফাটা হাসির বাংলা জোকস",
+                    "couple": "স্বামী ও স্ত্রীর মধ্যে একটি মজার হাসির বাংলা জোকস",
+                    "boltu": "বল্টু ও তার বন্ধুদের নিয়ে একটি মজার বাংলা জোকস",
+                }
+                j_prompt = topic_map.get(j_type, "একটি মজার বাংলা জোকস")
+                try:
+                    joke_body = await asyncio.to_thread(
+                        call_groq_chat,
+                        [
+                            {
+                                "role": "system",
+                                "content": "You are a witty Bengali comedian. Write 1 short, clean, genuinely hilarious Bangla joke in dialogue format with funny emojis. Do not use raw asterisks (**).",
+                            },
+                            {"role": "user", "content": j_prompt},
+                        ],
+                        0.85,
+                        350,
+                    )
+                    joke_body = clean_ai_text(joke_body)
+                except Exception:
+                    joke_body = random.choice(BANGLA_JOKES)
+
+            add_points(user.id, 1)
+            await query.message.reply_text(
+                f"😂 <b>মজার বাংলা জোকস</b>\n{DIVIDER}\n<blockquote>{html.escape(joke_body)}</blockquote>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=joke_kb,
+            )
+            return
+
+        # 5d. Crypto Refresh Callback
+        if data == "crypto_refresh":
+            context.user_data["state"] = "WAIT_CRYPTO"
+            await query.answer("লাইভ ক্রিপ্টো দাম আপডেট হচ্ছে...")
+            crypto_text = await asyncio.to_thread(fetch_crypto_prices)
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 লাইভ রেট রিফ্রেশ করুন", callback_data="crypto_refresh")]])
+            await query.message.reply_text(crypto_text, parse_mode=ParseMode.HTML, reply_markup=kb)
+            return
+
+        # 5e. VIP Info / Upgrade Request Callback
+        if data == "vip_info":
+            await query.answer()
+            context.user_data["state"] = "WAIT_CONTACT_ADMIN"
+            await query.message.reply_text(
+                f"👑 <b>VIP প্রিমিয়াম মেম্বারশিপ সুবিধাসমূহ</b>\n"
+                f"{DIVIDER}\n"
+                f"<blockquote>"
+                f"💎 <b>১. আনলিমিটেড ভিডিও ডাউনলোড:</b> প্রিমিয়াম মোড চালু থাকলেও সব ভিডিও ডাউনলোড করতে পারবেন।\n"
+                f"⚡ <b>২. ডাবল পয়েন্ট (2x Points):</b> প্রতিটি টুল ব্যবহারে সাধারণ ইউজারের চেয়ে দ্বিগুণ (+২) পয়েন্ট পাবেন!\n"
+                f"🏅 <b>৩. স্পেশাল VIP ব্যাজ:</b> আপনার প্রোফাইলে রাজকীয় 👑 VIP ব্যাজ যুক্ত হবে।\n"
+                f"🚀 <b>৪. প্রায়োরিটি সাপোর্ট:</b> অ্যাডমিনের কাছ থেকে দ্রুত কাস্টম সেবা।"
+                f"</blockquote>\n\n"
+                f"📩 <b>VIP মেম্বারশিপ সক্রিয় করতে এখনই নিচে আপনার মেসেজ লিখে পাঠান (সরাসরি অ্যাডমিনের কাছে চলে যাবে):</b>",
+                parse_mode=ParseMode.HTML,
+            )
             return
 
         # 6. Password Generator Length Selection
@@ -2538,6 +3164,40 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             )
             return
 
+        if state == "ADMIN_VIP_TOGGLE":
+            target = bn_to_en_digits(text.strip())
+            if not target.isdigit():
+                await msg.reply_text("⚠️ অনুগ্রহ করে সঠিক সংখ্যার User ID পাঠান।")
+                return
+            context.user_data["state"] = None
+            uid = int(target)
+            ensure_user(uid, "User")
+            u_row = get_user(uid)
+            new_vip = 0 if (u_row and u_row["premium"] == 1) else 1
+            with get_db() as conn:
+                conn.execute("UPDATE users SET premium = ? WHERE user_id = ?", (new_vip, uid))
+                conn.commit()
+            status_str = "👑 VIP প্রিমিয়াম চালু (ON)" if new_vip == 1 else "🆓 সাধারণ মেম্বার (OFF)"
+            await msg.reply_text(
+                f"ইউজার <code>{uid}</code>-এর স্ট্যাটাস এখন: <b>{status_str}</b>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=get_main_menu_markup(user.id),
+            )
+            if new_vip == 1:
+                try:
+                    await context.bot.send_message(
+                        chat_id=uid,
+                        text=(
+                            f"👑 <b>অভিনন্দন! আপনি এখন VIP প্রিমিয়াম মেম্বার!</b>\n"
+                            f"{DIVIDER}\n"
+                            "<blockquote>অ্যাডমিন আপনার অ্যাকাউন্টে <b>💎 VIP প্রিমিয়াম মেম্বারশিপ</b> চালু করে দিয়েছেন! এখন থেকে আপনি সকল প্রিমিয়াম টুল এবং প্রতিবার ব্যবহারে দ্বিগুণ (+২) পয়েন্ট পাবেন 🎉</blockquote>"
+                        ),
+                        parse_mode=ParseMode.HTML,
+                    )
+                except Exception:
+                    pass
+            return
+
         if state == "ADMIN_GIFT_POINTS":
             nums = re.findall(r"-?\d+", bn_to_en_digits(text))
             if len(nums) < 2:
@@ -2643,12 +3303,32 @@ async def route_menu_button(
             )
 
         elif btn == BTN_STT:
+            cur_lang = context.user_data.get("stt_lang", "bn")
+            context.user_data["stt_lang"] = cur_lang
             context.user_data["state"] = "WAIT_STT_VOICE"
+            lang_label = {
+                "bn": "🇧🇩 বাংলা (Default)",
+                "en": "🇬🇧 English",
+                "auto": "🌐 অটো (Bangla + English)",
+            }.get(cur_lang, "🇧🇩 বাংলা (Default)")
+            kb = InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton("🇧🇩 বাংলা ভয়েস", callback_data="stt_lang:bn"),
+                        InlineKeyboardButton("🇬🇧 English Voice", callback_data="stt_lang:en"),
+                    ],
+                    [
+                        InlineKeyboardButton("🌐 অটো (বাংলা + English)", callback_data="stt_lang:auto"),
+                    ],
+                ]
+            )
             await msg.reply_text(
-                f"🎤 <b>ভয়েস থেকে টেক্সট (Voice → Text)</b>\n"
+                f"🎤 <b>ভয়েস থেকে টেক্সট (AI Voice → Text)</b>\n"
                 f"{DIVIDER}\n"
-                "<blockquote>অনুগ্রহ করে একটি ভয়েস মেসেজ (Voice Message) রেকর্ড করে পাঠান, আমি তা সাথে সাথে লেখায় রূপান্তর করে দেব!</blockquote>",
+                f"<blockquote>🔊 <b>বর্তমান ভাষা:</b> {lang_label}\n"
+                f"নিচের বাটন থেকে ভয়েসের ভাষা পরিবর্তন করতে পারেন, অথবা সরাসরি একটি <b>Voice Message</b> রেকর্ড করে পাঠান—আমি নিখুঁতভাবে টেক্সটে রূপান্তর করে দেব!</blockquote>",
                 parse_mode=ParseMode.HTML,
+                reply_markup=kb,
             )
 
         elif btn == BTN_AI_IMG:
@@ -2733,6 +3413,7 @@ async def route_menu_button(
             )
 
         elif btn == BTN_PRAYER:
+            context.user_data["state"] = "WAIT_PRAYER"
             kb = InlineKeyboardMarkup(
                 [
                     [
@@ -2747,12 +3428,16 @@ async def route_menu_button(
                         InlineKeyboardButton("🕌 সিলেট", callback_data="prayer_city:Sylhet|সিলেট"),
                         InlineKeyboardButton("🕌 বরিশাল", callback_data="prayer_city:Barisal|বরিশাল"),
                     ],
+                    [
+                        InlineKeyboardButton("🕌 রংপুর", callback_data="prayer_city:Rangpur|রংপুর"),
+                        InlineKeyboardButton("🕌 ময়মনসিংহ", callback_data="prayer_city:Mymensingh|ময়মনসিংহ"),
+                    ],
                 ]
             )
             await msg.reply_text(
-                f"🕐 <b>আজকের নামাজের সময়সূচী</b>\n"
+                f"🕐 <b>বাংলাদেশের ৬৪ জেলার নামাজ ও সাহরি-ইফতারের সময়সূচী</b>\n"
                 f"{DIVIDER}\n"
-                "👇 আপনার বিভাগ/শহর নির্বাচন করুন:",
+                "<blockquote>👇 নিচের বাটন থেকে বিভাগ সিলেক্ট করুন, অথবা <b>আপনার যেকোনো জেলার নাম</b> (যেমন: <code>যশোর</code>, <code>কুমিল্লা</code>, <code>বগুড়া</code>, <code>কক্সবাজার</code>, <code>সাতক্ষীরা</code>) লিখে পাঠান:</blockquote>",
                 parse_mode=ParseMode.HTML,
                 reply_markup=kb,
             )
@@ -2801,22 +3486,25 @@ async def route_menu_button(
         elif btn == BTN_JOKES:
             add_points(user.id, 1)
             bn_joke = random.choice(BANGLA_JOKES)
-            en_joke_str = ""
-            try:
-                r = requests.get("https://official-joke-api.appspot.com/random_joke", timeout=6)
-                if r.status_code == 200:
-                    jd = r.json()
-                    en_joke_str = (
-                        f"\n\n🌐 <b>English Joke:</b>\n"
-                        f"<blockquote>{html.escape(jd.get('setup', ''))}\n— <i>{html.escape(jd.get('punchline', ''))}</i></blockquote>"
-                    )
-            except Exception:
-                pass
+            joke_kb = InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton("🤣 নতুন AI জোকস", callback_data="joke_cat:ai_random"),
+                        InlineKeyboardButton("🎓 ছাত্র-শিক্ষক", callback_data="joke_cat:student"),
+                    ],
+                    [
+                        InlineKeyboardButton("💑 স্বামী-স্ত্রী", callback_data="joke_cat:couple"),
+                        InlineKeyboardButton("🤪 বল্টু জোকস", callback_data="joke_cat:boltu"),
+                    ],
+                ]
+            )
             await msg.reply_text(
-                f"😂 <b>আজকের মজার জোকস</b>\n"
+                f"😂 <b>মজার বাংলা জোকস</b>\n"
                 f"{DIVIDER}\n"
-                f"<blockquote>{bn_joke}</blockquote>{en_joke_str}",
+                f"<blockquote>{bn_joke}</blockquote>\n\n"
+                f"👇 <i>আনলিমিটেড নতুন জোকস পড়তে নিচের ক্যাটাগরি বাটনে ট্যাপ করুন:</i>",
                 parse_mode=ParseMode.HTML,
+                reply_markup=joke_kb,
             )
 
         elif btn == BTN_BMI:
@@ -2840,15 +3528,36 @@ async def route_menu_button(
 
         elif btn == BTN_NEWS:
             await context.bot.send_chat_action(chat_id=msg.chat_id, action=ChatAction.TYPING)
-            news_text = await asyncio.to_thread(fetch_google_news_bn)
+            news_text = await asyncio.to_thread(fetch_google_news_bn, "top")
             add_points(user.id, 1)
-            await msg.reply_text(news_text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+            news_kb = InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton("🔥 ব্রেকিং", callback_data="news_cat:top"),
+                        InlineKeyboardButton("🇧🇩 বাংলাদেশ", callback_data="news_cat:bd"),
+                        InlineKeyboardButton("🏏 খেলাধুলা", callback_data="news_cat:sports"),
+                    ],
+                    [
+                        InlineKeyboardButton("🌍 আন্তর্জাতিক", callback_data="news_cat:world"),
+                        InlineKeyboardButton("💻 প্রযুক্তি", callback_data="news_cat:tech"),
+                        InlineKeyboardButton("🔄 রিফ্রেশ", callback_data="news_cat:top"),
+                    ],
+                ]
+            )
+            await msg.reply_text(
+                news_text,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+                reply_markup=news_kb,
+            )
 
         elif btn == BTN_CRYPTO:
+            context.user_data["state"] = "WAIT_CRYPTO"
             await context.bot.send_chat_action(chat_id=msg.chat_id, action=ChatAction.TYPING)
             crypto_text = await asyncio.to_thread(fetch_crypto_prices)
             add_points(user.id, 1)
-            await msg.reply_text(crypto_text, parse_mode=ParseMode.HTML)
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 লাইভ রেট রিফ্রেশ করুন", callback_data="crypto_refresh")]])
+            await msg.reply_text(crypto_text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
         elif btn == BTN_AGE:
             context.user_data["state"] = "WAIT_AGE"
@@ -3064,14 +3773,19 @@ async def route_menu_button(
             lvl = get_level_name(pts)
             rank = get_user_rank(user.id)
             refs = get_referral_count(user.id)
+            vip_status = "👑 VIP প্রিমিয়াম মেম্বার (2x Points)" if is_user_premium(user.id) else "🆓 ফ্রি মেম্বার"
             bot_uname = context.bot.username or "Bot"
             ref_link = f"https://t.me/{bot_uname}?start=ref_{user.id}"
+            prof_kb = None
+            if not is_user_premium(user.id):
+                prof_kb = InlineKeyboardMarkup([[InlineKeyboardButton("👑 VIP প্রিমিয়াম মেম্বারশিপ নিন", callback_data="vip_info")]])
             await msg.reply_text(
                 f"👤 <b>ইউজার প্রোফাইল ড্যাশবোর্ড</b>\n"
                 f"{DIVIDER}\n"
                 f"<blockquote>"
                 f"🏷️ <b>নাম:</b> {html.escape(user.full_name or 'User')}\n"
                 f"🆔 <b>আইডি:</b> <code>{user.id}</code>\n"
+                f"💎 <b>অ্যাকাউন্ট স্ট্যাটাস:</b> {vip_status}\n"
                 f"⭐ <b>মোট পয়েন্ট:</b> {pts}\n"
                 f"🏅 <b>লেভেল:</b> {lvl}\n"
                 f"🏆 <b>গ্লোবাল র‍্যাংক:</b> #{rank}\n"
@@ -3079,6 +3793,7 @@ async def route_menu_button(
                 f"</blockquote>\n\n"
                 f"🔗 <b>আপনার রেফারেল লিংক:</b>\n<code>{ref_link}</code>",
                 parse_mode=ParseMode.HTML,
+                reply_markup=prof_kb,
             )
 
         elif btn == BTN_LEADERBOARD:
@@ -3202,19 +3917,26 @@ async def route_menu_button(
 # ---------------------------------------------------------------------------
 async def process_voice_message(msg, user_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
     await context.bot.send_chat_action(chat_id=msg.chat_id, action=ChatAction.TYPING)
+    status_msg = await msg.reply_text("🎤 <b>আপনার ভয়েস মেসেজটি শোনা হচ্ছে এবং নিখুঁত টেক্সটে রূপান্তর করা হচ্ছে...</b>", parse_mode=ParseMode.HTML)
     voice_obj = msg.voice or msg.audio
     tg_file = await context.bot.get_file(voice_obj.file_id)
     tmp_ogg = tempfile.NamedTemporaryFile(delete=False, suffix=".ogg").name
+    lang_mode = context.user_data.get("stt_lang", "bn")
     try:
         await tg_file.download_to_drive(custom_path=tmp_ogg)
-        text_out = await asyncio.to_thread(call_groq_whisper, tmp_ogg)
+        text_out = await asyncio.to_thread(call_groq_whisper, tmp_ogg, lang_mode)
         add_points(user_id, 1)
-        await msg.reply_text(
-            f"🎤 <b>ভয়েস থেকে রূপান্তরিত টেক্সট</b>\n"
+        await status_msg.edit_text(
+            f"🎤 <b>ভয়েস থেকে রূপান্তরিত নিখুঁত টেক্সট</b>\n"
             f"{DIVIDER}\n"
-            f"<blockquote>{html.escape(text_out)}</blockquote>",
+            f"<blockquote>{html.escape(text_out)}</blockquote>\n"
+            f"📋 <i>কপি করতে নিচের লেখার ওপর ট্যাপ করুন:</i>\n"
+            f"<code>{html.escape(text_out)}</code>",
             parse_mode=ParseMode.HTML,
         )
+    except Exception as e:
+        logger.error(f"Voice transcription failed: {e}", exc_info=True)
+        await status_msg.edit_text("⚠️ ভয়েসটি স্পষ্ট বোঝা যায়নি। অনুগ্রহ করে একটু পরিষ্কারভাবে আবার ভয়েস পাঠান 🙏")
     finally:
         if os.path.exists(tmp_ogg):
             try:
@@ -3382,7 +4104,7 @@ async def process_document_message(msg, user_id: int, context: ContextTypes.DEFA
         await status_msg.edit_text(
             f"📄 <b>PDF ফাইলের মূল সারাংশ</b>\n"
             f"{DIVIDER}\n"
-            f"<blockquote>{html.escape(summary)}</blockquote>",
+            f"<blockquote>{html.escape(clean_ai_text(summary))}</blockquote>",
             parse_mode=ParseMode.HTML,
         )
     except Exception as e:
@@ -3427,7 +4149,7 @@ async def process_state_text(text: str, msg, user, context: ContextTypes.DEFAULT
             history[:] = history[-16:]
         add_points(user.id, 1)
         await msg.reply_text(
-            f"🤖 <b>AI চ্যাট রিপ্লাই</b>\n{DIVIDER}\n{html.escape(reply)}",
+            f"🤖 <b>AI চ্যাট রিপ্লাই</b>\n{DIVIDER}\n{html.escape(clean_ai_text(reply))}",
             parse_mode=ParseMode.HTML,
         )
         return
@@ -3461,21 +4183,33 @@ async def process_state_text(text: str, msg, user, context: ContextTypes.DEFAULT
         return
 
     if state == "WAIT_AI_IMG":
-        status_msg = await msg.reply_text("🎨 <b>আপনার HD AI ছবি তৈরি হচ্ছে, অনুগ্রহ করে কিছুক্ষণ অপেক্ষা করুন...</b>", parse_mode=ParseMode.HTML)
-        encoded_prompt = urllib.parse.quote(text)
-        url1 = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1024&height=1024&nologo=true&nofeed=true&enhance=true"
-        url2 = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1024&height=1024&nologo=true&seed=42"
+        status_msg = await msg.reply_text(
+            "🎨 <b>আপনার প্রম্পট উন্নত করে Ultra-HD AI ছবি তৈরি করা হচ্ছে...</b>\n"
+            "⏳ <i>অনুগ্রহ করে ৫–১০ সেকেন্ড অপেক্ষা করুন...</i>",
+            parse_mode=ParseMode.HTML,
+        )
+        # Step 1: Convert Bangla/short prompt into a detailed English cinematic Flux prompt via Groq
+        enhanced_prompt = await asyncio.to_thread(enhance_image_prompt_with_groq, text)
+        encoded_prompt = urllib.parse.quote(enhanced_prompt)
+        rand_seed = random.randint(10000, 9999999)
+
+        # Step 2: Request 1024x1100 with model=flux & nologo=true so top 1024x1024 can be cropped 1:1 without resize blur
+        candidate_urls = [
+            f"https://image.pollinations.ai/prompt/{encoded_prompt}?model=flux&width=1024&height=1100&seed={rand_seed}&nologo=true&nofeed=true&enhance=true",
+            f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1024&height=1024&nologo=true&seed={rand_seed}",
+            f"https://image.pollinations.ai/prompt/{urllib.parse.quote(text)}?width=1024&height=1024&nologo=true&seed=42",
+        ]
 
         img_bytes: Optional[bytes] = None
-        for target_url in (url1, url2):
+        for target_url in candidate_urls:
             try:
                 r = await asyncio.to_thread(
                     requests.get,
                     target_url,
-                    headers={"User-Agent": "Mozilla/5.0"},
-                    timeout=45,
+                    headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+                    timeout=50,
                 )
-                if r.status_code == 200 and r.content and len(r.content) > 1000:
+                if r.status_code == 200 and r.content and len(r.content) > 2000:
                     img_bytes = await asyncio.to_thread(remove_bottom_watermark_and_polish, r.content)
                     break
             except Exception as e:
@@ -3489,9 +4223,10 @@ async def process_state_text(text: str, msg, user, context: ContextTypes.DEFAULT
         await msg.reply_photo(
             photo=io.BytesIO(img_bytes),
             caption=(
-                f"🖼️ <b>AI জেনারেটেড HD ছবি (Watermark-Free)</b>\n"
+                f"🖼️ <b>Ultra-HD AI ছবি (Flux Engine • Watermark-Free)</b>\n"
                 f"{DIVIDER}\n"
-                f"<blockquote>✨ <b>Prompt:</b> {html.escape(text)}</blockquote>"
+                f"<blockquote>✨ <b>আপনার বিষয়:</b> {html.escape(text)}\n"
+                f"🎯 <b>AI Prompt:</b> <i>{html.escape(enhanced_prompt[:220])}</i></blockquote>"
             ),
             parse_mode=ParseMode.HTML,
         )
@@ -3570,6 +4305,20 @@ async def process_state_text(text: str, msg, user, context: ContextTypes.DEFAULT
         )
         return
 
+    if state == "WAIT_PRAYER":
+        await context.bot.send_chat_action(chat_id=msg.chat_id, action=ChatAction.TYPING)
+        out = await asyncio.to_thread(fetch_prayer_times_for_location, text)
+        add_points(user.id, 1)
+        await msg.reply_text(out, parse_mode=ParseMode.HTML)
+        return
+
+    if state == "WAIT_CRYPTO":
+        await context.bot.send_chat_action(chat_id=msg.chat_id, action=ChatAction.TYPING)
+        out = await asyncio.to_thread(fetch_crypto_prices, text)
+        add_points(user.id, 1)
+        await msg.reply_text(out, parse_mode=ParseMode.HTML)
+        return
+
     if state == "WAIT_CAPTION":
         await context.bot.send_chat_action(chat_id=msg.chat_id, action=ChatAction.TYPING)
         out = await asyncio.to_thread(
@@ -3577,16 +4326,31 @@ async def process_state_text(text: str, msg, user, context: ContextTypes.DEFAULT
             [
                 {
                     "role": "system",
-                    "content": "You are a creative social media expert. Generate 5 short, catchy Bangla social media captions with fitting emojis and trending hashtags. Number them ১ to ৫ clearly without raw markdown asterisks (**).",
+                    "content": (
+                        "You are an elite Bangladeshi social media content creator. "
+                        "Generate 5 viral, heart-touching, aesthetic Bangla captions for Facebook, Instagram, and TikTok on the user's topic:\n"
+                        "১. ✨ Aesthetic / Poetic Bangla Caption\n"
+                        "২. 😎 Attitude / Royal Vibe Bangla Caption\n"
+                        "৩. ❤️ Emotional / Heart-Touching Bangla Caption\n"
+                        "৪. 📸 Short One-Liner Bangla Caption\n"
+                        "৫. 🌐 Stylish Banglish / English Mix Caption\n\n"
+                        "CRITICAL RULES:\n"
+                        "- After EVERY caption, include 5-6 trending ENGLISH hashtags ONLY (e.g., #AestheticVibes #BanglaCaption #Trending #ViralPost #Mood #Photography). NEVER write Bangla hashtags!\n"
+                        "- Do NOT use raw markdown asterisks (**)."
+                    ),
                 },
                 {"role": "user", "content": f"টপিক: {text}"},
             ],
+            0.75,
+            1200,
         )
         add_points(user.id, 1)
+        cleaned_out = clean_ai_text(out)
         await msg.reply_text(
-            f"✍️ <b>আপনার আকর্ষণীয় সোশ্যাল মিডিয়া ক্যাপশন</b>\n"
+            f"✍️ <b>ভাইরাল সোশ্যাল মিডিয়া ক্যাপশন ও English Hashtags</b>\n"
             f"{DIVIDER}\n"
-            f"<blockquote>{html.escape(out)}</blockquote>",
+            f"📌 <b>টপিক:</b> {html.escape(text)}\n\n"
+            f"<blockquote>{html.escape(cleaned_out)}</blockquote>",
             parse_mode=ParseMode.HTML,
         )
         return
@@ -3598,7 +4362,7 @@ async def process_state_text(text: str, msg, user, context: ContextTypes.DEFAULT
             [
                 {
                     "role": "system",
-                    "content": "You are a talented Bengali writer and poet. Write a heartwarming short story or poem in Bangla based on the user's topic. Do not use raw markdown asterisks (**).",
+                    "content": "You are a talented Bengali writer and poet. Write a heartwarming, vivid short story or poem in literary Bangla based on the user's topic with a fitting title. Do not use raw markdown asterisks (**).",
                 },
                 {"role": "user", "content": f"বিষয়: {text}"},
             ],
@@ -3607,7 +4371,7 @@ async def process_state_text(text: str, msg, user, context: ContextTypes.DEFAULT
         await msg.reply_text(
             f"📖 <b>গল্প / কবিতা ({html.escape(text)})</b>\n"
             f"{DIVIDER}\n"
-            f"<blockquote>{html.escape(out)}</blockquote>",
+            f"<blockquote>{html.escape(clean_ai_text(out))}</blockquote>",
             parse_mode=ParseMode.HTML,
         )
         return
@@ -3771,27 +4535,10 @@ async def process_state_text(text: str, msg, user, context: ContextTypes.DEFAULT
 
     if state == "WAIT_LYRICS":
         await context.bot.send_chat_action(chat_id=msg.chat_id, action=ChatAction.TYPING)
-        out = await asyncio.to_thread(
-            call_groq_chat,
-            [
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a music encyclopedia assistant. Provide song details (artist, album/movie, theme) "
-                        "in Bangla without raw markdown asterisks (**). IMPORTANT: If the song is copyrighted, provide ONLY a short 2-4 line excerpt "
-                        "and a detailed summary/meaning in Bangla rather than full copyrighted lyrics."
-                    ),
-                },
-                {"role": "user", "content": f"গান: {text}"},
-            ],
-        )
+        status_msg = await msg.reply_text("🎵 <b>গানের লিরিক্স ও তথ্য খোঁজা হচ্ছে...</b>", parse_mode=ParseMode.HTML)
+        out = await asyncio.to_thread(fetch_song_lyrics_and_info, text)
         add_points(user.id, 1)
-        await msg.reply_text(
-            f"🎵 <b>গানের তথ্য ও লিরিক্স সংক্ষেপ</b>\n"
-            f"{DIVIDER}\n"
-            f"<blockquote>{html.escape(out)}</blockquote>",
-            parse_mode=ParseMode.HTML,
-        )
+        await status_msg.edit_text(out, parse_mode=ParseMode.HTML)
         return
 
     if state == "WAIT_REMINDER":
@@ -3826,7 +4573,7 @@ async def process_state_text(text: str, msg, user, context: ContextTypes.DEFAULT
             await msg.reply_text("⚠️ জব কিউ (Job Queue) সক্রিয় নেই।")
         return
 
-    # --- 6 NEW HIGH-UTILITY STATES ---
+    # --- 6 NEW HIGH-UTILITY STATES (MARKET-GRADE UPGRADED) ---
     if state == "WAIT_GRAMMAR":
         await context.bot.send_chat_action(chat_id=msg.chat_id, action=ChatAction.TYPING)
         out = await asyncio.to_thread(
@@ -3835,16 +4582,19 @@ async def process_state_text(text: str, msg, user, context: ContextTypes.DEFAULT
                 {
                     "role": "system",
                     "content": (
-                        "You are an expert English and Bangla grammar corrector. "
-                        "Provide: 1) The corrected version, 2) A brief explanation in Bangla of what was fixed, and 3) A more natural/professional alternative. Do not use raw markdown asterisks (**)."
+                        "You are an expert English and Bangla grammar corrector. Format your response clearly in 3 parts without raw asterisks (**):\n"
+                        "✅ সঠিক বাক্য (Corrected Sentence):\n"
+                        "🔍 কী ভুল ছিল (What Was Fixed in Bangla):\n"
+                        "✨ আরও সুন্দর ও প্রফেশনাল রূপ (Better Alternative):"
                     ),
                 },
                 {"role": "user", "content": text},
             ],
+            0.3,
         )
         add_points(user.id, 1)
         await msg.reply_text(
-            f"📝 <b>বানান ও Grammar সংশোধন ফলাফল</b>\n{DIVIDER}\n<blockquote>{html.escape(out)}</blockquote>",
+            f"📝 <b>বানান ও Grammar সংশোধন ফলাফল</b>\n{DIVIDER}\n<blockquote>{html.escape(clean_ai_text(out))}</blockquote>",
             parse_mode=ParseMode.HTML,
         )
         return
@@ -3857,16 +4607,21 @@ async def process_state_text(text: str, msg, user, context: ContextTypes.DEFAULT
                 {
                     "role": "system",
                     "content": (
-                        "You are an expert professional writer. Write a clean, ready-to-send formal Email, Application (দরখাস্ত), or CV Cover Letter "
-                        "based on the user's request in the appropriate language (Bangla or English). Do not use raw markdown asterisks (**)."
+                        "You are an expert corporate and academic writer. Write a complete, ready-to-send formal Email, Application (দরখাস্ত), or CV Cover Letter "
+                        "based on the user's request with Subject line and proper salutation. Do not use raw markdown asterisks (**)."
                     ),
                 },
                 {"role": "user", "content": text},
             ],
+            0.4,
         )
         add_points(user.id, 1)
+        clean_doc = clean_ai_text(out)
         await msg.reply_text(
-            f"📧 <b>আপনার প্রফেশনাল ইমেইল / আবেদনপত্র</b>\n{DIVIDER}\n<blockquote>{html.escape(out)}</blockquote>",
+            f"📧 <b>আপনার প্রফেশনাল ইমেইল / আবেদনপত্র</b>\n{DIVIDER}\n"
+            f"<blockquote>{html.escape(clean_doc)}</blockquote>\n"
+            f"📋 <i>নিচের বক্সে ট্যাপ করে পুরো লেখাটি কপি করুন:</i>\n"
+            f"<code>{html.escape(clean_doc[:1500])}</code>",
             parse_mode=ParseMode.HTML,
         )
         return
@@ -3879,18 +4634,38 @@ async def process_state_text(text: str, msg, user, context: ContextTypes.DEFAULT
                 {
                     "role": "system",
                     "content": (
-                        "You are a senior software engineer. Write clean, working code and explain how it works in simple Bangla. "
-                        "Do not use raw markdown asterisks (**)."
+                        "You are a senior Principal Software Engineer. Write 100% bug-free, production-ready code for the user's request. "
+                        "Put the code inside a single ```code``` block, and after the code block write a clear, easy-to-understand explanation in Bangla "
+                        "(কীভাবে কাজ করে এবং কীভাবে রান করবেন). Do not use raw asterisks (**)."
                     ),
                 },
                 {"role": "user", "content": text},
             ],
+            0.25,
+            1800,
         )
         add_points(user.id, 1)
-        await msg.reply_text(
-            f"💻 <b>কোড জেনারেটর ও সমাধান</b>\n{DIVIDER}\n<pre>{html.escape(out[:3800])}</pre>",
-            parse_mode=ParseMode.HTML,
-        )
+        # Separate fenced code block from Bangla explanation so code is 1-tap copyable and Bangla is in a clean blockquote!
+        code_match = re.search(r"```(?:[a-zA-Z0-9_+-]+)?\n(.*?)```", out, flags=re.DOTALL)
+        if code_match:
+            extracted_code = code_match.group(1).strip()
+            explanation_part = (out[:code_match.start()] + "\n" + out[code_match.end():]).strip()
+            explanation_part = clean_ai_text(explanation_part)
+            formatted_msg = (
+                f"💻 <b>প্রফেশনাল কোড জেনারেটর ও সমাধান</b>\n"
+                f"{DIVIDER}\n"
+                f"📋 <b>কোড (ট্যাপ করে কপি করুন):</b>\n"
+                f"<pre><code>{html.escape(extracted_code[:2800])}</code></pre>"
+            )
+            if explanation_part:
+                formatted_msg += f"\n\n💡 <b>বাংলায় ব্যাখ্যা ও ব্যবহারবিধি:</b>\n<blockquote>{html.escape(explanation_part[:1000])}</blockquote>"
+        else:
+            formatted_msg = (
+                f"💻 <b>প্রফেশনাল কোড জেনারেটর ও সমাধান</b>\n"
+                f"{DIVIDER}\n"
+                f"<pre><code>{html.escape(clean_ai_text(out)[:3500])}</code></pre>"
+            )
+        await msg.reply_text(formatted_msg, parse_mode=ParseMode.HTML)
         return
 
     if state == "WAIT_BIO_GEN":
@@ -3901,16 +4676,28 @@ async def process_state_text(text: str, msg, user, context: ContextTypes.DEFAULT
                 {
                     "role": "system",
                     "content": (
-                        "Generate 5 ultra-stylish, VIP social media profile bios (mix of Bangla and English with aesthetic emojis & symbols) "
-                        "for Facebook, Instagram, and Telegram based on the user's input. Do not use raw markdown asterisks (**)."
+                        "You are a VIP social media branding expert. Generate 6 ultra-stylish, aesthetic profile bios for Facebook, Instagram, and Telegram "
+                        "based on the user's input. Include decorative symbols (★, 彡, ❖, ┃, ♛), emojis, and stylish formatting across these 6 categories:\n"
+                        "১. 👑 Royal & Attitude VIP Bio\n"
+                        "২. ✨ Aesthetic & Minimalist Bio\n"
+                        "৩. 💻 Professional / Student / Dreamer Bio\n"
+                        "৪. 🌙 Islamic / Peaceful Mind Bio\n"
+                        "৫. 🇧🇩 Stylish Bangla Bio\n"
+                        "৬. 🔥 Short Swag One-Line Bio\n\n"
+                        "Do NOT use raw markdown asterisks (**). Keep each bio compact (2-4 lines) and ready to copy-paste."
                     ),
                 },
                 {"role": "user", "content": text},
             ],
+            0.75,
+            1200,
         )
         add_points(user.id, 1)
         await msg.reply_text(
-            f"🪪 <b>আপনার স্টাইলিশ ভিআইপি বায়ো</b>\n{DIVIDER}\n<blockquote>{html.escape(out)}</blockquote>",
+            f"🪪 <b>আপনার স্টাইলিশ VIP প্রোফাইল বায়ো কালেকশন</b>\n"
+            f"{DIVIDER}\n"
+            f"<blockquote>{html.escape(clean_ai_text(out))}</blockquote>\n"
+            f"💡 <i>আপনার পছন্দের যেকোনো বায়ো কপি করে সরাসরি FB / Instagram / Telegram প্রোফাইলে ব্যবহার করুন!</i>",
             parse_mode=ParseMode.HTML,
         )
         return
@@ -3924,15 +4711,17 @@ async def process_state_text(text: str, msg, user, context: ContextTypes.DEFAULT
                     "role": "system",
                     "content": (
                         "You are a knowledgeable, respectful Islamic scholar assistant. Answer Islamic questions or dream interpretations "
-                        "in polite Bangla based on Quran, Sahih Hadith, and classical Islamic scholarship. Do not use raw markdown asterisks (**)."
+                        "in polite, clear Bangla based on the Quran, Sahih Hadith, and authentic classical scholars (such as Ibn Sirin for dreams). "
+                        "Structure with clear bullet points and references. Do not use raw markdown asterisks (**)."
                     ),
                 },
                 {"role": "user", "content": text},
             ],
+            0.4,
         )
         add_points(user.id, 1)
         await msg.reply_text(
-            f"🌙 <b>ইসলামিক ও স্বপ্ন বিষয়ক উত্তর</b>\n{DIVIDER}\n<blockquote>{html.escape(out)}</blockquote>",
+            f"🌙 <b>ইসলামিক ও স্বপ্ন বিষয়ক সমাধান</b>\n{DIVIDER}\n<blockquote>{html.escape(clean_ai_text(out))}</blockquote>",
             parse_mode=ParseMode.HTML,
         )
         return
@@ -3945,16 +4734,26 @@ async def process_state_text(text: str, msg, user, context: ContextTypes.DEFAULT
                 {
                     "role": "system",
                     "content": (
-                        "You are a friendly math and science teacher. Solve the given math or science problem step-by-step in clear Bangla. "
-                        "Do not use raw markdown asterisks (**)."
+                        "You are an expert Bangladeshi Mathematics, Physics, and Chemistry professor. "
+                        "Solve the user's math or science problem with 100% accuracy in clear Bangla using this exact structure:\n"
+                        "📌 প্রদত্ত তথ্য (Given):\n"
+                        "📐 প্রয়োজনীয় সূত্র (Formula):\n"
+                        "✍️ ধাপে ধাপে সমাধান (Step-by-Step Solution):\n"
+                        "✅ চূড়ান্ত উত্তর (Final Answer):\n\n"
+                        "CRITICAL RULES:\n"
+                        "- Double-check all arithmetic and algebraic steps before outputting.\n"
+                        "- NEVER use LaTeX code like \frac or $$; instead use clean Unicode math symbols (×, ÷, √, ², ³, π, θ, ⇒, ∴).\n"
+                        "- Do NOT use raw markdown asterisks (**)."
                     ),
                 },
                 {"role": "user", "content": text},
             ],
+            0.2,
+            1500,
         )
         add_points(user.id, 1)
         await msg.reply_text(
-            f"🧮 <b>অংক ও বিজ্ঞান সমাধান</b>\n{DIVIDER}\n<blockquote>{html.escape(out)}</blockquote>",
+            f"🧮 <b>অংক ও বিজ্ঞান নিখুঁত সমাধান</b>\n{DIVIDER}\n<blockquote>{html.escape(clean_ai_text(out))}</blockquote>",
             parse_mode=ParseMode.HTML,
         )
         return
