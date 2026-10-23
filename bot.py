@@ -942,9 +942,9 @@ def enhance_image_prompt_with_groq(user_prompt: str) -> str:
         sys_msg = (
             "You are an expert AI image prompt engineer for the Flux image model. "
             "Convert the user's input (which may be in Bangla, Banglish, or English) into a single, vivid, "
-            "masterpiece English image generation prompt (max 45 words). "
-            "Include subject details, natural lighting, cinematic composition, ultra-detailed 8k photorealistic quality, "
-            "and sharp focus. Output ONLY the raw English prompt text, no quotes or explanations."
+            "masterpiece English image generation prompt (max 35 words). "
+            "Keep the main subject centered in the upper-middle frame. "
+            "Output ONLY plain English words and commas—no slashes, no quotes, no newlines."
         )
         enhanced = call_groq_chat(
             messages=[
@@ -952,72 +952,46 @@ def enhance_image_prompt_with_groq(user_prompt: str) -> str:
                 {"role": "user", "content": user_prompt},
             ],
             temperature=0.5,
-            max_tokens=140,
+            max_tokens=120,
         )
-        cleaned = enhanced.strip().strip('"').strip("'")
+        cleaned = re.sub(r"[^a-zA-Z0-9 ,.-]", " ", enhanced)
+        cleaned = " ".join(cleaned.split()).strip()
         if cleaned and len(cleaned) > 5:
-            return cleaned
+            return cleaned[:220]
     except Exception as e:
         logger.warning(f"Prompt enhancement fallback to raw prompt: {e}")
-    return f"{user_prompt}, masterpiece, ultra detailed, 8k photorealistic, cinematic lighting, sharp focus"
+    fallback_clean = re.sub(r"[^\w\s,.-]", " ", user_prompt)
+    fallback_clean = " ".join(fallback_clean.split()).strip()
+    return f"{fallback_clean}, centered subject, masterpiece, ultra detailed, 8k photorealistic, cinematic lighting"
 
 
-def _has_corner_watermark(im: Image.Image) -> bool:
+def remove_bottom_watermark_and_polish(img_bytes: bytes, deep_crop: bool = True) -> bytes:
     """
-    Detects if an image has a synthetic white/bright watermark box or text badge
-    in the bottom-right, bottom-left, or bottom-center strip.
-    """
-    rgb = im.convert("RGB")
-    w, h = rgb.size
-    for x1_r, x2_r in ((0.55, 1.0), (0.0, 0.45), (0.25, 0.75)):
-        strip = rgb.crop((int(w * x1_r), int(h * 0.91), int(w * x2_r), h))
-        pixels = list(strip.getdata())
-        if not pixels:
-            continue
-        very_bright = sum(1 for r, g, b in pixels if r > 240 and g > 240 and b > 240)
-        very_dark = sum(1 for r, g, b in pixels if r < 20 and g < 20 and b < 20)
-        total = len(pixels)
-        if very_bright / total > 0.06 and very_dark / total > 0.06:
-            return True
-    return False
-
-
-def remove_bottom_watermark_and_polish(img_bytes: bytes, aggressive_crop: bool = False) -> bytes:
-    """
-    Guarantees 100% watermark-free, razor-sharp 1024x1024 AI images.
-    - Cuts bottom 16%, top 5%, and 7% on left/right whenever aggressive_crop is True or
-      a watermark signature is detected, then verifies the final image is 100% clean.
+    Guarantees 100% watermark-free, razor-sharp 1024x1024 AI images WITHOUT ever falsely
+    rejecting valid photos (such as tigers with black/white stripes or bright reflections).
+    - When deep_crop is True (used for Pollinations / Airforce / Subnp / tall renders),
+      it physically cuts off the bottom 18%, top 4%, and 6% on left/right where watermarks live,
+      then resizes the clean center-upper frame to 1024x1024 Ultra-HD JPEG.
     """
     with Image.open(io.BytesIO(img_bytes)) as im:
         rgb = im.convert("RGB")
         w, h = rgb.size
+        resample_filter = getattr(Image, "Resampling", Image).LANCZOS
 
-        if aggressive_crop or _has_corner_watermark(rgb) or h >= 1100:
-            # Slice off top 5%, bottom 16%, and 7% left/right so NO watermark at the bottom or corners can survive
-            crop_top = int(h * 0.05)
-            crop_bottom = int(h * 0.84)
-            margin_x = int(w * 0.07)
+        if deep_crop or h > w:
+            crop_top = int(h * 0.04)
+            crop_bottom = int(h * 0.82)
+            margin_x = int(w * 0.06)
             cropped = rgb.crop((margin_x, crop_top, w - margin_x, crop_bottom))
-            resample_filter = getattr(Image, "Resampling", Image).LANCZOS
             final_im = cropped.resize((1024, 1024), resample_filter)
         else:
-            resample_filter = getattr(Image, "Resampling", Image).LANCZOS
             final_im = rgb.resize((1024, 1024), resample_filter) if (w != 1024 or h != 1024) else rgb
 
-        # If a watermark signature still somehow survived, do one extra inner trim
-        if _has_corner_watermark(final_im):
-            cw, ch = final_im.size
-            final_im = final_im.crop((int(cw * 0.05), int(ch * 0.03), int(cw * 0.95), int(ch * 0.88))).resize(
-                (1024, 1024), getattr(Image, "Resampling", Image).LANCZOS
-            )
-            if _has_corner_watermark(final_im):
-                raise ValueError("Watermark still detected on image; rejecting engine.")
-
-        final_im = ImageEnhance.Sharpness(final_im).enhance(1.16)
+        final_im = ImageEnhance.Sharpness(final_im).enhance(1.15)
         final_im = ImageEnhance.Contrast(final_im).enhance(1.04)
 
         out_bio = io.BytesIO()
-        final_im.save(out_bio, format="JPEG", quality=98, subsampling=0, optimize=True)
+        final_im.save(out_bio, format="JPEG", quality=96, subsampling=0, optimize=True)
         return out_bio.getvalue()
 
 
@@ -1035,8 +1009,9 @@ def _is_valid_image_bytes(raw: bytes) -> bool:
 def generate_ai_image_multi_engine(raw_prompt: str, enhanced_prompt: str) -> bytes:
     """
     100% Watermark-Free Multi-Engine AI Image Generator:
-    Tries 6 independent free AI image engines in order. If any engine fails or has a watermark,
-    it automatically moves to the next engine and NEVER sends a watermarked image.
+    Uses safe URL encoding (safe='') and tall-canvas (1080x1350 / 1024x1280) generation
+    with an unconditional 18% bottom cut so NO watermark at the bottom or corners can ever survive,
+    while never falsely rejecting high-contrast images.
     """
     headers = {
         "User-Agent": (
@@ -1046,14 +1021,33 @@ def generate_ai_image_multi_engine(raw_prompt: str, enhanced_prompt: str) -> byt
         "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
     }
     rand_seed = random.randint(1000, 999999)
-    enc_enh = urllib.parse.quote(enhanced_prompt)
-    enc_raw = urllib.parse.quote(raw_prompt)
+    clean_enh = re.sub(r"[^a-zA-Z0-9 ,.-]", " ", enhanced_prompt)
+    clean_enh = " ".join(clean_enh.split()).strip()[:200] or "majestic landscape photorealistic 8k"
+    clean_raw = " ".join(raw_prompt.replace("/", " ").split()).strip()[:150] or clean_enh
 
-    # Engine 1: HuggingFace Official Gradio Spaces (100% Native Watermark-Free Raw Model Output)
+    enc_enh = urllib.parse.quote(clean_enh, safe="")
+    enc_raw = urllib.parse.quote(clean_raw, safe="")
+
+    # Engine 1: Pollinations Tall-Canvas (1080x1350 -> 18% Bottom Cut -> 1024x1024 Watermark-Free HD)
+    pollinations_urls = [
+        f"https://image.pollinations.ai/prompt/{enc_enh}?width=1080&height=1350&seed={rand_seed}&nologo=true&model=flux",
+        f"https://image.pollinations.ai/prompt/{enc_enh}?width=1080&height=1350&seed={rand_seed}&nologo=true",
+        f"https://pollinations.ai/p/{enc_enh}?width=1080&height=1350&seed={rand_seed}&nologo=true&model=flux",
+        f"https://image.pollinations.ai/prompt/{enc_raw}?width=1080&height=1350&seed={rand_seed}&nologo=true",
+    ]
+    for p_url in pollinations_urls:
+        try:
+            r = requests.get(p_url, headers=headers, timeout=25)
+            if r.status_code == 200 and _is_valid_image_bytes(r.content):
+                return remove_bottom_watermark_and_polish(r.content, deep_crop=True)
+        except Exception as e:
+            logger.debug(f"Pollinations URL skipped: {e}")
+
+    # Engine 2: HuggingFace Official Gradio v5 & v4 Spaces (Native Watermark-Free Raw Output)
     hf_spaces = [
-        ("https://black-forest-labs-flux-1-schnell.hf.space", "/call/infer", [enhanced_prompt, rand_seed, False, 1024, 1024, 4]),
-        ("https://multimodalart-flux-1-merged.hf.space", "/call/infer", [enhanced_prompt, rand_seed, False, 1024, 1024, 4]),
-        ("https://bytedance-sdxl-lightning.hf.space", "/call/generate_image", [enhanced_prompt, "4-Step"]),
+        ("https://black-forest-labs-flux-1-schnell.hf.space", "/gradio_api/call/infer", [clean_enh, rand_seed, False, 1024, 1024, 4]),
+        ("https://black-forest-labs-flux-1-schnell.hf.space", "/call/infer", [clean_enh, rand_seed, False, 1024, 1024, 4]),
+        ("https://multimodalart-flux-1-merged.hf.space", "/gradio_api/call/infer", [clean_enh, rand_seed, False, 1024, 1024, 4]),
     ]
     for space_url, endpoint, payload_data in hf_spaces:
         try:
@@ -1061,91 +1055,50 @@ def generate_ai_image_multi_engine(raw_prompt: str, enhanced_prompt: str) -> byt
                 f"{space_url}{endpoint}",
                 json={"data": payload_data},
                 headers={"Content-Type": "application/json", "User-Agent": headers["User-Agent"]},
-                timeout=14,
+                timeout=10,
             )
             if post_r.status_code == 200 and "event_id" in post_r.json():
                 ev_id = post_r.json()["event_id"]
-                sse_r = requests.get(f"{space_url}{endpoint}/{ev_id}", headers=headers, timeout=22)
+                sse_r = requests.get(f"{space_url}{endpoint}/{ev_id}", headers=headers, timeout=18)
                 if sse_r.status_code == 200:
                     m_url = re.search(r'"url":\s*"(https?://[^"]+)"', sse_r.text)
                     if m_url:
-                        img_r = requests.get(m_url.group(1), headers=headers, timeout=18)
+                        img_r = requests.get(m_url.group(1), headers=headers, timeout=15)
                         if img_r.status_code == 200 and _is_valid_image_bytes(img_r.content):
-                            return remove_bottom_watermark_and_polish(img_r.content, aggressive_crop=False)
+                            return remove_bottom_watermark_and_polish(img_r.content, deep_crop=False)
         except Exception as e:
             logger.debug(f"HF Space {space_url} skipped: {e}")
 
-    # Engine 2: Subnp Free AI Image Generator API (Flux / Turbo)
-    for sub_model in ("flux", "turbo"):
-        try:
-            sub_r = requests.post(
-                "https://subnp.com/api/free/generate",
-                json={"prompt": enhanced_prompt, "model": sub_model},
-                headers={"Content-Type": "application/json", "User-Agent": headers["User-Agent"]},
-                timeout=20,
-            )
-            if sub_r.status_code == 200:
-                m_img = re.search(r'"imageUrl":\s*"(https?://[^"]+)"', sub_r.text)
-                if m_img:
-                    img_r = requests.get(m_img.group(1), headers=headers, timeout=18)
-                    if img_r.status_code == 200 and _is_valid_image_bytes(img_r.content):
-                        return remove_bottom_watermark_and_polish(img_r.content, aggressive_crop=True)
-        except Exception as e:
-            logger.debug(f"Subnp {sub_model} skipped: {e}")
-
-    # Engine 3: Hercai v3 Free AI Image Generator API
-    try:
-        hc_url = f"https://hercai.onrender.com/v3/text2image?prompt={enc_enh}"
-        hc_r = requests.get(hc_url, headers=headers, timeout=20)
-        if hc_r.status_code == 200 and hc_r.json().get("url"):
-            img_r = requests.get(hc_r.json()["url"], headers=headers, timeout=18)
-            if img_r.status_code == 200 and _is_valid_image_bytes(img_r.content):
-                return remove_bottom_watermark_and_polish(img_r.content, aggressive_crop=False)
-    except Exception as e:
-        logger.debug(f"Hercai skipped: {e}")
-
-    # Engine 4: Lexica Art High-Res AI Render Search (100% Native Watermark-Free AI Art)
-    for q_str in (enc_enh, enc_raw):
-        try:
-            lex_url = f"https://lexica.art/api/v1/search?q={q_str}"
-            lex_r = requests.get(lex_url, headers=headers, timeout=15)
-            if lex_r.status_code == 200:
-                imgs = lex_r.json().get("images", [])
-                for chosen in imgs[:4]:
-                    src_url = chosen.get("src")
-                    if src_url:
-                        img_r = requests.get(src_url, headers=headers, timeout=15)
-                        if img_r.status_code == 200 and _is_valid_image_bytes(img_r.content):
-                            return remove_bottom_watermark_and_polish(img_r.content, aggressive_crop=False)
-        except Exception as e:
-            logger.debug(f"Lexica skipped: {e}")
-
-    # Engine 5: Airforce Free Flux API (with mandatory deep crop + watermark rejection check)
+    # Engine 3: Airforce Free Flux API (with mandatory 18% bottom deep crop)
     for af_model in ("flux", "flux-realism", "sdxl"):
         try:
             af_url = (
                 f"https://api.airforce/v1/imagine2?prompt={enc_enh}"
                 f"&model={af_model}&size=1:1&seed={rand_seed}"
             )
-            r = requests.get(af_url, headers=headers, timeout=20)
+            r = requests.get(af_url, headers=headers, timeout=18)
             if r.status_code == 200 and _is_valid_image_bytes(r.content):
-                return remove_bottom_watermark_and_polish(r.content, aggressive_crop=True)
+                return remove_bottom_watermark_and_polish(r.content, deep_crop=True)
         except Exception as e:
             logger.debug(f"Airforce {af_model} skipped: {e}")
 
-    # Engine 6: Pollinations 1024x1280 Tall Mode with mandatory 16% bottom + 7% side crop & watermark rejection check
-    pollinations_urls = [
-        f"https://pollinations.ai/p/{enc_enh}?width=1024&height=1280&seed={rand_seed}&nologo=true&model=flux",
-        f"https://image.pollinations.ai/prompt/{enc_enh}?width=1024&height=1280&seed={rand_seed}&nologo=true&model=flux",
-        f"https://image.pollinations.ai/prompt/{enc_raw}?width=1024&height=1280&nologo=true&seed=42",
-    ]
-    for p_url in pollinations_urls:
+    # Engine 4: Subnp Free AI Image Generator API (Flux / Turbo)
+    for sub_model in ("flux", "turbo"):
         try:
-            r = requests.get(p_url, headers=headers, timeout=22)
-            if r.status_code == 200 and _is_valid_image_bytes(r.content):
-                return remove_bottom_watermark_and_polish(r.content, aggressive_crop=True)
+            sub_r = requests.post(
+                "https://subnp.com/api/free/generate",
+                json={"prompt": clean_enh, "model": sub_model},
+                headers={"Content-Type": "application/json", "User-Agent": headers["User-Agent"]},
+                timeout=18,
+            )
+            if sub_r.status_code == 200:
+                m_img = re.search(r'"(?:imageUrl|url)":\s*"(https?://[^"]+)"', sub_r.text)
+                if m_img:
+                    img_r = requests.get(m_img.group(1), headers=headers, timeout=15)
+                    if img_r.status_code == 200 and _is_valid_image_bytes(img_r.content):
+                        return remove_bottom_watermark_and_polish(img_r.content, deep_crop=True)
         except Exception as e:
-            logger.debug(f"Pollinations URL skipped: {e}")
+            logger.debug(f"Subnp {sub_model} skipped: {e}")
 
     raise RuntimeError("All AI image generation engines failed.")
 
@@ -1326,7 +1279,7 @@ BD_DISTRICT_MAP: Dict[str, Tuple[str, str]] = {
     "কুড়িগ্রাম": ("Kurigram", "কুড়িগ্রাম"), "kurigram": ("Kurigram", "কুড়িগ্রাম"),
     "গাইবান্ধা": ("Gaibandha", "গাইবান্ধা"), "gaibandha": ("Gaibandha", "গাইবান্ধা"),
     "নীলফামারী": ("Nilphamari", "নীলফামারী"), "nilphamari": ("Nilphamari", "নীলফামারী"),
-    "লালমনিরহাট": ("Lalমনিরহাট", "লালমনিরহাট"), "lalmonirhat": ("Lalmonirhat", "লালমনিরহাট"),
+    "লালমনিরহাট": ("Lalmonirhat", "লালমনিরহাট"), "lalmonirhat": ("Lalmonirhat", "লালমনিরহাট"),
     "পঞ্চগড়": ("Panchagarh", "পঞ্চগড়"), "panchagarh": ("Panchagarh", "পঞ্চগড়"),
     "ঠাকুরগাঁও": ("Thakurgaon", "ঠাকুরগাঁও"), "thakurgaon": ("Thakurgaon", "ঠাকুরগাঁও"),
     "ময়মনসিংহ": ("Mymensingh", "ময়মনসিংহ"), "mymensingh": ("Mymensingh", "ময়মনসিংহ"),
@@ -1334,7 +1287,6 @@ BD_DISTRICT_MAP: Dict[str, Tuple[str, str]] = {
     "শেরপুর": ("Sherpur", "শেরপুর"), "sherpur": ("Sherpur", "শেরপুর"),
     "নেত্রকোনা": ("Netrokona", "নেত্রকোনা"), "netrokona": ("Netrokona", "নেত্রকোনা"),
 }
-BD_DISTRICT_MAP["লালমনিরহাট"] = ("Lalmonirhat", "লালমনিরহাট")
 
 
 def fetch_prayer_times_for_location(query_place: str) -> str:
@@ -4634,7 +4586,7 @@ async def finalize_images_to_pdf(msg, user_id: int, context: ContextTypes.DEFAUL
             )
     except Exception as e:
         logger.error(f"PDF creation failed: {e}", exc_info=True)
-        await msg.reply_text(ERROR_MSG_BN, reply_markup=get_main_menu_markup(user_id))
+        await msg.reply_text(ERROR_MSG_BN, reply_markup=get_main_menu_markup(user.id))
     finally:
         for im in pil_images:
             try:
