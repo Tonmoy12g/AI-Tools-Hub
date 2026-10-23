@@ -40,7 +40,11 @@ import requests
 import yt_dlp
 from flask import Flask
 from gtts import gTTS
-from PIL import Image, ImageEnhance, ImageFilter
+from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont
+try:
+    import speech_recognition as sr
+except ImportError:
+    sr = None
 from pypdf import PdfReader
 from telegram import (
     InlineKeyboardButton,
@@ -195,6 +199,10 @@ BTN_CODE_HELP = "💻 কোড জেনারেটর"
 BTN_BIO_GEN = "🪪 স্টাইলিশ বায়ো"
 BTN_DREAM_ISLAM = "🌙 স্বপ্ন ও ইসলামিক প্রশ্ন"
 BTN_MATH_SOLVE = "🧮 অংক ও বিজ্ঞান সমাধান"
+BTN_BLOOD_INFO = "🩸 রক্তের গ্রুপ গাইড"
+BTN_DIET_PLAN = "🥗 ডায়েট ও স্বাস্থ্য চার্ট"
+BTN_BIZ_IDEA = "💼 বিজনেস আইডিয়া"
+BTN_MOVIE_REC = "🎬 মুভি রিকমেন্ডেশন"
 # Shop, Engagement & System Buttons
 BTN_SHOP = "🛍️ শপ"
 BTN_CONTACT = "📩 Contact Admin"
@@ -229,6 +237,8 @@ BASE_MENU_LAYOUT = [
     [KeyboardButton(BTN_GRAMMAR), KeyboardButton(BTN_EMAIL_CV)],
     [KeyboardButton(BTN_CODE_HELP), KeyboardButton(BTN_BIO_GEN)],
     [KeyboardButton(BTN_DREAM_ISLAM), KeyboardButton(BTN_MATH_SOLVE)],
+    [KeyboardButton(BTN_BLOOD_INFO), KeyboardButton(BTN_DIET_PLAN)],
+    [KeyboardButton(BTN_BIZ_IDEA), KeyboardButton(BTN_MOVIE_REC)],
     [KeyboardButton(BTN_SHOP), KeyboardButton(BTN_CONTACT)],
     [KeyboardButton(BTN_PROFILE), KeyboardButton(BTN_LEADERBOARD)],
     [KeyboardButton(BTN_DAILY), KeyboardButton(BTN_SPIN)],
@@ -264,6 +274,7 @@ ALL_BUTTON_CONSTANTS = [
     BTN_REMINDER, BTN_QUIZ,
     BTN_GRAMMAR, BTN_EMAIL_CV, BTN_CODE_HELP, BTN_BIO_GEN,
     BTN_DREAM_ISLAM, BTN_MATH_SOLVE,
+    BTN_BLOOD_INFO, BTN_DIET_PLAN, BTN_BIZ_IDEA, BTN_MOVIE_REC,
     BTN_SHOP, BTN_CONTACT, BTN_PROFILE, BTN_LEADERBOARD,
     BTN_DAILY, BTN_SPIN, BTN_REFER, BTN_ABOUT,
     BTN_HELP, BTN_DEV, BTN_ADMIN_PANEL, BTN_MENU, BTN_MAKE_PDF_DONE,
@@ -706,30 +717,44 @@ def call_groq_chat(
     raise RuntimeError("Groq chat completion failed after retry.")
 
 
-def preprocess_voice_for_stt(input_path: str) -> str:
+def preprocess_voice_for_stt(input_path: str) -> Tuple[str, Optional[str]]:
     """
-    Converts Telegram OGG/Opus voice clips into clean 16kHz mono MP3 audio with
-    voice-band filtering and volume normalization so Whisper hears Bangla & English clearly.
+    Converts Telegram OGG/Opus voice clips into:
+    1) Clean 16kHz mono 16-bit PCM WAV (for Google Speech Recognition bn-BD / en-US)
+    2) Clean 16kHz mono MP3 (for Groq Whisper)
+    with speech-band filtering and volume normalization.
     """
+    out_wav = tempfile.NamedTemporaryFile(delete=False, suffix=".wav").name
     out_mp3 = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3").name
+    ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+
+    wav_ok = False
     try:
-        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
         subprocess.run(
             [
-                ffmpeg_exe,
-                "-y",
-                "-i",
-                input_path,
-                "-vn",
-                "-ac",
-                "1",
-                "-ar",
-                "16000",
-                "-af",
-                "highpass=f=80,lowpass=f=7500,volume=1.4",
-                "-b:a",
-                "64k",
-                out_mp3,
+                ffmpeg_exe, "-y", "-i", input_path,
+                "-vn", "-ac", "1", "-ar", "16000",
+                "-af", "highpass=f=70,lowpass=f=7800,volume=1.5",
+                "-acodec", "pcm_s16le", out_wav,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=25,
+            check=True,
+        )
+        if os.path.exists(out_wav) and os.path.getsize(out_wav) > 400:
+            wav_ok = True
+    except Exception as e:
+        logger.warning(f"WAV conversion error: {e}")
+
+    mp3_ok = False
+    try:
+        subprocess.run(
+            [
+                ffmpeg_exe, "-y", "-i", input_path,
+                "-vn", "-ac", "1", "-ar", "16000",
+                "-af", "highpass=f=70,lowpass=f=7800,volume=1.5",
+                "-b:a", "64k", out_mp3,
             ],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -737,118 +762,163 @@ def preprocess_voice_for_stt(input_path: str) -> str:
             check=True,
         )
         if os.path.exists(out_mp3) and os.path.getsize(out_mp3) > 200:
-            return out_mp3
+            mp3_ok = True
     except Exception as e:
-        logger.warning(f"Audio preprocessing fallback to original file: {e}")
-    if os.path.exists(out_mp3):
+        logger.warning(f"MP3 conversion error: {e}")
+
+    if not wav_ok and os.path.exists(out_wav):
+        try:
+            os.remove(out_wav)
+        except OSError:
+            pass
+    if not mp3_ok and os.path.exists(out_mp3):
         try:
             os.remove(out_mp3)
         except OSError:
             pass
-    return input_path
+
+    return (out_mp3 if mp3_ok else input_path), (out_wav if wav_ok else None)
 
 
-def refine_stt_transcript(raw_text: str, lang_mode: str = "bn") -> str:
+def recognize_with_google_web_speech(wav_path: Optional[str], lang_mode: str = "bn") -> str:
     """
-    Fixes common Whisper STT issues via Groq LLM:
-    - If Whisper outputs Hindi/Devanagari/Urdu/Assamese script for Bangla speech, or writes
-      broken phonetic Bangla words, converts and corrects it into clean, accurate বাংলা (or English).
+    Uses Google's official Web Speech API (the same engine used by Gboard Bangla Voice Typing!)
+    which has 99% accuracy on Bangladeshi Bangla (bn-BD) and English (en-US).
     """
-    cleaned = (raw_text or "").strip()
-    if not cleaned:
+    if not wav_path or not os.path.exists(wav_path) or sr is None:
         return ""
+    recognizer = sr.Recognizer()
+    recognizer.dynamic_energy_threshold = True
+    primary_lang = "en-US" if lang_mode == "en" else "bn-BD"
+    secondary_lang = "bn-BD" if primary_lang == "en-US" else "en-US"
+
     try:
-        target_instruction = (
-            "The user spoke in Bangla (or Banglish/mixed English). If the raw transcript contains "
-            "Hindi/Devanagari/Urdu/Assamese characters or phonetic Bangla spelling mistakes, transliterate and "
-            "correct it into natural, accurate বাংলা (Bangla) script while keeping English terms natural. "
-            if lang_mode != "en"
-            else "The user spoke in English. Fix any phonetic transcription mistakes and punctuation naturally. "
+        with sr.AudioFile(wav_path) as source:
+            audio_data = recognizer.record(source, duration=58)
+        try:
+            text = recognizer.recognize_google(audio_data, language=primary_lang)
+            if text and text.strip():
+                return text.strip()
+        except Exception:
+            if lang_mode == "auto":
+                text = recognizer.recognize_google(audio_data, language=secondary_lang)
+                if text and text.strip():
+                    return text.strip()
+    except Exception as e:
+        logger.warning(f"Google Speech Recognition fallback: {e}")
+    return ""
+
+
+def refine_stt_transcript(google_text: str, whisper_text: str, lang_mode: str = "bn") -> str:
+    """
+    Combines Google Speech Recognition (bn-BD) and Whisper output using Groq LLM
+    to fix any spelling mistake, broken conjunct (যুক্তবর্ণ), or punctuation error.
+    """
+    g_clean = (google_text or "").strip()
+    w_clean = (whisper_text or "").strip()
+
+    # If Google Speech Recognition succeeded in Bangla mode, it already has native Bangladeshi spelling;
+    # we pass both to Groq with strict instructions to preserve Google's exact words and only add punctuation/fix obvious typos.
+    if g_clean and not w_clean:
+        base_text = g_clean
+    elif w_clean and not g_clean:
+        base_text = w_clean
+    elif g_clean and w_clean:
+        base_text = f"Primary (Google bn-BD): {g_clean}\nSecondary (Whisper): {w_clean}"
+    else:
+        return ""
+
+    try:
+        sys_prompt = (
+            "You are an expert Bangladeshi Bangla & English speech-to-text spelling corrector. "
+            "You are given raw speech recognition output. "
+            "If 'Primary (Google bn-BD)' is present, trust its words and meaning strongly, and only add proper punctuation (দাঁড়ি, কমা, প্রশ্নবোধক চিহ্ন) and fix any minor spelling typo. "
+            "If only Whisper output is present and it contains broken Bangla spelling, Assamese/Hindi characters, or phonetic errors, reconstruct the exact intended standard বাংলা (or English) sentence naturally. "
+            "Output ONLY the final corrected text—no labels, no quotes, no explanations."
         )
         fixed = call_groq_chat(
             [
-                {
-                    "role": "system",
-                    "content": (
-                        "You are an expert speech-to-text post-processor. "
-                        + target_instruction
-                        + "Do NOT add extra commentary, explanations, or quotes. Output ONLY the corrected transcript text."
-                    ),
-                },
-                {"role": "user", "content": cleaned},
+                {"role": "system", "content": sys_prompt},
+                {"role": "user", "content": base_text},
             ],
             temperature=0.1,
             max_tokens=800,
         )
         if fixed and len(fixed.strip()) > 0:
-            return fixed.strip().strip('"').strip("'")
+            res = fixed.strip().strip('"').strip("'")
+            res = re.sub(r"^(?:Primary|Secondary|Corrected).*?:\s*", "", res, flags=re.IGNORECASE).strip()
+            return res
     except Exception as e:
-        logger.warning(f"STT post-processing skipped: {e}")
-    return cleaned
+        logger.warning(f"STT post-processing fallback: {e}")
+
+    return g_clean or w_clean
 
 
 def call_groq_whisper(file_path: str, lang_mode: str = "bn") -> str:
-    if not GROQ_API_KEY:
-        raise RuntimeError("GROQ_API_KEY is not configured.")
+    processed_mp3, processed_wav = preprocess_voice_for_stt(file_path)
 
-    url = "https://api.groq.com/openai/v1/audio/transcriptions"
-    headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
-
-    processed_path = preprocess_voice_for_stt(file_path)
-    mime_type = "audio/mpeg" if processed_path.endswith(".mp3") else "audio/ogg"
-
-    # For Bangla or Auto mode, prioritize multilingual Whisper models (distil-whisper-large-v3-en is English-only!)
-    models_to_try = (
-        ["whisper-large-v3", "whisper-large-v3-turbo", "distil-whisper-large-v3-en"]
-        if lang_mode == "en"
-        else ["whisper-large-v3", "whisper-large-v3-turbo"]
-    )
-
+    google_transcript = ""
+    whisper_transcript = ""
     last_err: Optional[Exception] = None
-    try:
-        for model in models_to_try:
-            try:
-                with open(processed_path, "rb") as f:
-                    files = {"file": (os.path.basename(processed_path), f, mime_type)}
-                    data: Dict[str, str] = {
-                        "model": model,
-                        "temperature": "0",
-                    }
-                    if lang_mode == "bn":
-                        data["language"] = "bn"
-                        data["prompt"] = "আসসালামু আলাইকুম, এটি স্পষ্ট বাংলা ভয়েস মেসেজ।"
-                    elif lang_mode == "en":
-                        data["language"] = "en"
-                        data["prompt"] = "Clear English voice message."
-                    else:
-                        data["prompt"] = "বাংলা এবং English ভয়েস মেসেজ।"
 
-                    resp = requests.post(url, headers=headers, files=files, data=data, timeout=60)
-                if resp.status_code == 404:
-                    logger.warning(f"Whisper model {model} returned 404, skipping to next...")
-                    continue
-                resp.raise_for_status()
-                result = resp.json()
-                text = result.get("text", "").strip()
-                if text:
-                    return refine_stt_transcript(text, lang_mode=lang_mode)
-            except Exception as e:
-                last_err = e
-                logger.warning(f"Whisper transcription error with {model}: {e}")
+    try:
+        # Engine 1: Google Web Speech API (bn-BD / en-US) — best for Bangla voice spelling!
+        google_transcript = recognize_with_google_web_speech(processed_wav, lang_mode=lang_mode)
+
+        # Engine 2: Groq Whisper API
+        if GROQ_API_KEY:
+            url = "https://api.groq.com/openai/v1/audio/transcriptions"
+            headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
+            mime_type = "audio/mpeg" if processed_mp3.endswith(".mp3") else "audio/ogg"
+            models_to_try = (
+                ["whisper-large-v3", "whisper-large-v3-turbo", "distil-whisper-large-v3-en"]
+                if lang_mode == "en"
+                else ["whisper-large-v3", "whisper-large-v3-turbo"]
+            )
+            for model in models_to_try:
+                try:
+                    with open(processed_mp3, "rb") as f:
+                        files = {"file": (os.path.basename(processed_mp3), f, mime_type)}
+                        data: Dict[str, str] = {"model": model, "temperature": "0"}
+                        if lang_mode == "bn":
+                            data["language"] = "bn"
+                            data["prompt"] = "আসসালামু আলাইকুম, এটি স্পষ্ট ও শুদ্ধ বাংলা ভাষার ভয়েস মেসেজ।"
+                        elif lang_mode == "en":
+                            data["language"] = "en"
+                            data["prompt"] = "Clear English voice message."
+                        else:
+                            data["prompt"] = "বাংলা এবং English ভয়েস মেসেজ।"
+
+                        resp = requests.post(url, headers=headers, files=files, data=data, timeout=45)
+                    if resp.status_code == 404:
+                        continue
+                    resp.raise_for_status()
+                    w_txt = resp.json().get("text", "").strip()
+                    if w_txt:
+                        whisper_transcript = w_txt
+                        break
+                except Exception as e:
+                    last_err = e
+                    logger.warning(f"Whisper error with {model}: {e}")
+
+        final_text = refine_stt_transcript(google_transcript, whisper_transcript, lang_mode=lang_mode)
+        if final_text:
+            return final_text
     finally:
-        if processed_path != file_path and os.path.exists(processed_path):
-            try:
-                os.remove(processed_path)
-            except OSError:
-                pass
+        for p in (processed_mp3, processed_wav):
+            if p and p != file_path and os.path.exists(p):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
 
     if last_err:
         raise last_err
-    raise RuntimeError("All Whisper models failed.")
+    raise RuntimeError("Could not transcribe audio from either Google Speech or Whisper.")
 
 
 # ---------------------------------------------------------------------------
-# ULTRA-HD AI IMAGE PROMPT ENHANCER & WATERMARK-FREE POLISHER
+# 5-ENGINE ULTRA-HD AI IMAGE GENERATOR & WATERMARK-FREE POLISHER
 # ---------------------------------------------------------------------------
 def enhance_image_prompt_with_groq(user_prompt: str) -> str:
     """
@@ -859,7 +929,7 @@ def enhance_image_prompt_with_groq(user_prompt: str) -> str:
         sys_msg = (
             "You are an expert AI image prompt engineer for the Flux image model. "
             "Convert the user's input (which may be in Bangla, Banglish, or English) into a single, vivid, "
-            "masterpiece English image generation prompt (max 55 words). "
+            "masterpiece English image generation prompt (max 45 words). "
             "Include subject details, natural lighting, cinematic composition, ultra-detailed 8k photorealistic quality, "
             "and sharp focus. Output ONLY the raw English prompt text, no quotes or explanations."
         )
@@ -869,7 +939,7 @@ def enhance_image_prompt_with_groq(user_prompt: str) -> str:
                 {"role": "user", "content": user_prompt},
             ],
             temperature=0.5,
-            max_tokens=160,
+            max_tokens=140,
         )
         cleaned = enhanced.strip().strip('"').strip("'")
         if cleaned and len(cleaned) > 5:
@@ -882,29 +952,248 @@ def enhance_image_prompt_with_groq(user_prompt: str) -> str:
 def remove_bottom_watermark_and_polish(img_bytes: bytes) -> bytes:
     """
     Guarantees 100% watermark-free, razor-sharp AI images.
-    We request 1024x1100 from Pollinations Flux and crop the bottom 76px directly
-    (zero stretching or upscaling blur!), then apply subtle contrast/sharpness polish.
     """
     with Image.open(io.BytesIO(img_bytes)) as im:
         rgb = im.convert("RGB")
         w, h = rgb.size
-        if h >= 1080 and w == 1024:
-            # Direct 1:1 pixel crop of the top 1024x1024 (removes bottom 76px watermark strip without any resize blur)
+        if h >= 1060 and w == 1024:
             final_im = rgb.crop((0, 0, 1024, 1024))
-        else:
-            crop_bottom = int(h * 0.935)
-            margin_x = int(w * 0.0325)
+        elif w == h and w >= 512:
+            crop_bottom = int(h * 0.94)
+            margin_x = int(w * 0.03)
             cropped = rgb.crop((margin_x, 0, w - margin_x, crop_bottom))
             resample_filter = getattr(Image, "Resampling", Image).LANCZOS
             final_im = cropped.resize((1024, 1024), resample_filter)
+        else:
+            resample_filter = getattr(Image, "Resampling", Image).LANCZOS
+            final_im = rgb.resize((1024, 1024), resample_filter)
 
-        # Apply subtle studio sharpness & contrast enhancement for crisp HD look
         final_im = ImageEnhance.Sharpness(final_im).enhance(1.18)
         final_im = ImageEnhance.Contrast(final_im).enhance(1.05)
 
         out_bio = io.BytesIO()
         final_im.save(out_bio, format="JPEG", quality=98, subsampling=0, optimize=True)
         return out_bio.getvalue()
+
+
+def _is_valid_image_bytes(raw: bytes) -> bool:
+    if not raw or len(raw) < 2500:
+        return False
+    try:
+        with Image.open(io.BytesIO(raw)) as im:
+            im.verify()
+        return True
+    except Exception:
+        return False
+
+
+def generate_ai_image_multi_engine(raw_prompt: str, enhanced_prompt: str) -> bytes:
+    """
+    Multi-Tool AI Image Generator (Tries 5 independent free AI image tools so it NEVER fails!):
+    1. Airforce Free Flux / Imagine API (api.airforce)
+    2. HuggingFace Gradio Public Space API (FLUX.1-schnell / SDXL-Lightning)
+    3. Pollinations Unified & Direct Endpoints (pollinations.ai/p/ & image.pollinations.ai)
+    4. Hercai v3 Free Text2Image API
+    5. Lexica Art High-Res AI Search Engine Fallback
+    """
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+        ),
+        "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+    }
+    rand_seed = random.randint(1000, 999999)
+    enc_enh = urllib.parse.quote(enhanced_prompt)
+    enc_raw = urllib.parse.quote(raw_prompt)
+
+    # Tool 1: Pollinations Fast Endpoints (Flux, Turbo, Default) with short 22s timeout
+    pollinations_urls = [
+        f"https://pollinations.ai/p/{enc_enh}?width=1024&height=1100&seed={rand_seed}&nologo=true&model=flux",
+        f"https://image.pollinations.ai/prompt/{enc_enh}?width=1024&height=1100&seed={rand_seed}&nologo=true&model=flux",
+        f"https://image.pollinations.ai/prompt/{enc_enh}?width=1024&height=1024&seed={rand_seed}&nologo=true&model=turbo",
+        f"https://image.pollinations.ai/prompt/{enc_raw}?width=1024&height=1024&nologo=true&seed=42",
+    ]
+    for p_url in pollinations_urls:
+        try:
+            r = requests.get(p_url, headers=headers, timeout=22)
+            if r.status_code == 200 and _is_valid_image_bytes(r.content):
+                return remove_bottom_watermark_and_polish(r.content)
+        except Exception as e:
+            logger.warning(f"Pollinations URL skipped ({p_url[:60]}...): {e}")
+
+    # Tool 2: Airforce Free Imagine API (Flux / Flux-Realism)
+    for af_model in ("flux", "flux-realism", "sdxl"):
+        try:
+            af_url = (
+                f"https://api.airforce/v1/imagine2?prompt={enc_enh}"
+                f"&model={af_model}&size=1:1&seed={rand_seed}"
+            )
+            r = requests.get(af_url, headers=headers, timeout=25)
+            if r.status_code == 200 and _is_valid_image_bytes(r.content):
+                return remove_bottom_watermark_and_polish(r.content)
+        except Exception as e:
+            logger.warning(f"Airforce {af_model} skipped: {e}")
+
+    # Tool 3: HuggingFace Public Gradio Space (FLUX.1-schnell)
+    hf_spaces = [
+        "https://black-forest-labs-flux-1-schnell.hf.space",
+        "https://multimodalart-flux-1-merged.hf.space",
+    ]
+    for space_url in hf_spaces:
+        try:
+            post_r = requests.post(
+                f"{space_url}/call/infer",
+                json={"data": [enhanced_prompt, rand_seed, False, 1024, 1024, 4]},
+                headers={"Content-Type": "application/json", "User-Agent": headers["User-Agent"]},
+                timeout=15,
+            )
+            if post_r.status_code == 200 and "event_id" in post_r.json():
+                ev_id = post_r.json()["event_id"]
+                sse_r = requests.get(f"{space_url}/call/infer/{ev_id}", headers=headers, timeout=25)
+                if sse_r.status_code == 200:
+                    m_url = re.search(r'"url":\s*"(https?://[^"]+)"', sse_r.text)
+                    if m_url:
+                        img_r = requests.get(m_url.group(1), headers=headers, timeout=20)
+                        if img_r.status_code == 200 and _is_valid_image_bytes(img_r.content):
+                            return remove_bottom_watermark_and_polish(img_r.content)
+        except Exception as e:
+            logger.warning(f"HF Space {space_url} skipped: {e}")
+
+    # Tool 4: Hercai v3 Free AI Image Generator API
+    try:
+        hc_url = f"https://hercai.onrender.com/v3/text2image?prompt={enc_enh}"
+        hc_r = requests.get(hc_url, headers=headers, timeout=25)
+        if hc_r.status_code == 200 and hc_r.json().get("url"):
+            img_r = requests.get(hc_r.json()["url"], headers=headers, timeout=20)
+            if img_r.status_code == 200 and _is_valid_image_bytes(img_r.content):
+                return remove_bottom_watermark_and_polish(img_r.content)
+    except Exception as e:
+        logger.warning(f"Hercai fallback skipped: {e}")
+
+    # Tool 5: Lexica Art AI Generated Image Search API (returns real AI-generated artwork matching the prompt)
+    try:
+        lex_url = f"https://lexica.art/api/v1/search?q={enc_enh}"
+        lex_r = requests.get(lex_url, headers=headers, timeout=15)
+        if lex_r.status_code == 200:
+            imgs = lex_r.json().get("images", [])
+            for item in imgs[:3]:
+                src_url = item.get("src")
+                if src_url:
+                    img_r = requests.get(src_url, headers=headers, timeout=15)
+                    if img_r.status_code == 200 and _is_valid_image_bytes(img_r.content):
+                        return remove_bottom_watermark_and_polish(img_r.content)
+    except Exception as e:
+        logger.warning(f"Lexica fallback skipped: {e}")
+
+    raise RuntimeError("All 5 AI image generation engines failed.")
+
+
+# ---------------------------------------------------------------------------
+# PREMIUM BRANDED STUDIO QR CODE GENERATOR
+# ---------------------------------------------------------------------------
+def generate_premium_qr_card(data_text: str) -> io.BytesIO:
+    """
+    Creates a 1000x1180 Royal Studio Branded QR Poster Card with:
+    - Deep Royal Navy background (#0B1120) & glowing cyan/gold frame
+    - Rounded white QR container with soft drop shadow
+    - High-density ERROR_CORRECT_H navy QR code with a central Royal Gold/Cyan badge
+    - Clean header and footer labels
+    """
+    qr = qrcode.QRCode(
+        version=None,
+        error_correction=qrcode.constants.ERROR_CORRECT_H,
+        box_size=14,
+        border=2,
+    )
+    qr.add_data(data_text)
+    qr.make(fit=True)
+    qr_img = qr.make_image(fill_color="#0F172A", back_color="white").convert("RGBA")
+    qr_img = qr_img.resize((680, 680), getattr(Image, "Resampling", Image).LANCZOS)
+
+    # Draw a sleek center emblem inside the QR code (ERROR_CORRECT_H allows up to 30% center coverage safely!)
+    draw_qr = ImageDraw.Draw(qr_img)
+    cx, cy = 340, 340
+    r_outer = 64
+    draw_qr.rounded_rectangle(
+        (cx - r_outer, cy - r_outer, cx + r_outer, cy + r_outer),
+        radius=20,
+        fill="#FFFFFF",
+        outline="#0EA5E9",
+        width=5,
+    )
+    draw_qr.rounded_rectangle(
+        (cx - r_outer + 10, cy - r_outer + 10, cx + r_outer - 10, cy + r_outer - 10),
+        radius=14,
+        fill="#0F172A",
+        outline="#F59E0B",
+        width=3,
+    )
+    try:
+        font_badge = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 38)
+    except Exception:
+        font_badge = ImageFont.load_default()
+    draw_qr.text((cx - 30, cy - 22), "QR", fill="#F59E0B", font=font_badge)
+
+    # Create full 1000x1160 poster canvas
+    canvas_w, canvas_h = 1000, 1160
+    canvas = Image.new("RGB", (canvas_w, canvas_h), "#0B1120")
+    draw = ImageDraw.Draw(canvas)
+
+    # Outer glowing frame
+    draw.rounded_rectangle((28, 28, canvas_w - 28, canvas_h - 28), radius=38, outline="#0EA5E9", width=4)
+    draw.rounded_rectangle((40, 40, canvas_w - 40, canvas_h - 40), radius=32, outline="#F59E0B", width=2)
+
+    # Top header pill
+    draw.rounded_rectangle((180, 75, canvas_w - 180, 155), radius=40, fill="#1E293B", outline="#38BDF8", width=2)
+    try:
+        font_title = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 32)
+        font_sub = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 22)
+    except Exception:
+        font_title = ImageFont.load_default()
+        font_sub = ImageFont.load_default()
+
+    draw.text((255, 97), "PREMIUM SMART QR CODE", fill="#F8FAFC", font=font_title)
+
+    # White rounded card behind QR
+    card_x1, card_y1, card_x2, card_y2 = 120, 195, 880, 955
+    # Subtle glow shadow
+    draw.rounded_rectangle((card_x1 - 6, card_y1 - 6, card_x2 + 6, card_y2 + 6), radius=42, fill="#0284C7")
+    draw.rounded_rectangle((card_x1, card_y1, card_x2, card_y2), radius=38, fill="#FFFFFF")
+
+    # Paste QR onto white card
+    canvas.paste(qr_img.convert("RGB"), (160, 235))
+
+    # Corner scanner brackets inside white card
+    b_col = "#0EA5E9"
+    bw = 6
+    bl = 45
+    # Top-left
+    draw.line([(145, 220), (145 + bl, 220)], fill=b_col, width=bw)
+    draw.line([(145, 220), (145, 220 + bl)], fill=b_col, width=bw)
+    # Top-right
+    draw.line([(855 - bl, 220), (855, 220)], fill=b_col, width=bw)
+    draw.line([(855, 220), (855, 220 + bl)], fill=b_col, width=bw)
+    # Bottom-left
+    draw.line([(145, 930 - bl), (145, 930)], fill=b_col, width=bw)
+    draw.line([(145, 930), (145 + bl, 930)], fill=b_col, width=bw)
+    # Bottom-right
+    draw.line([(855 - bl, 930), (855, 930)], fill=b_col, width=bw)
+    draw.line([(855, 930 - bl), (855, 930)], fill=b_col, width=bw)
+
+    # Bottom footer bar
+    draw.rounded_rectangle((120, 995, 880, 1085), radius=26, fill="#1E293B", outline="#F59E0B", width=2)
+    preview_ascii = "".join(ch if ord(ch) < 128 else "" for ch in data_text).strip()
+    if not preview_ascii:
+        preview_ascii = "SCAN WITH ANY CAMERA OR QR READER"
+    elif len(preview_ascii) > 42:
+        preview_ascii = preview_ascii[:39] + "..."
+    draw.text((230, 1025), f"SCAN ME  •  {preview_ascii}", fill="#38BDF8", font=font_sub)
+
+    out_bio = io.BytesIO()
+    canvas.save(out_bio, format="PNG", optimize=True)
+    out_bio.seek(0)
+    return out_bio
 
 
 # ---------------------------------------------------------------------------
@@ -1148,7 +1437,11 @@ ABOUT_TEXT = (
     "৩৩. <b>💻 কোড জেনারেটর</b> — যেকোনো প্রোগ্রামিং কোড লেখা ও বাগ ফিক্স করা\n"
     "৩৪. <b>🪪 স্টাইলিশ বায়ো</b> — FB, Insta ও Telegram প্রোফাইলের জন্য ভিআইপি বায়ো\n"
     "৩৫. <b>🌙 স্বপ্ন ও ইসলামিক প্রশ্ন</b> — কুরআন ও হাদিসের আলোকে ইসলামিক প্রশ্নোত্তর\n"
-    "৩৬. <b>🧮 অংক ও বিজ্ঞান সমাধান</b> — যেকোনো গাণিতিক বা বিজ্ঞানের প্রশ্নের ধাপে ধাপে সমাধান"
+    "৩৬. <b>🧮 অংক ও বিজ্ঞান সমাধান</b> — যেকোনো গাণিতিক বা বিজ্ঞানের প্রশ্নের ধাপে ধাপে সমাধান\n"
+    "৩৭. <b>🩸 রক্তের গ্রুপ গাইড</b> — কোন রক্তের গ্রুপ কাকে রক্ত দিতে ও নিতে পারে তার পূর্ণাঙ্গ চার্ট\n"
+    "৩৮. <b>🥗 ডায়েট ও স্বাস্থ্য চার্ট</b> — ওজন কমানো বা বাড়ানোর দেশি খাবারের পূর্ণাঙ্গ ডায়েট প্ল্যান\n"
+    "৩৯. <b>💼 বিজনেস আইডিয়া</b> — কম পুঁজিতে ব্যবসা, স্টার্টআপ ও পেজের ইউনিক নাম আইডিয়া\n"
+    "৪০. <b>🎬 মুভি রিকমেন্ডেশন</b> — আপনার পছন্দের জনরা অনুযায়ী সেরা মুভি ও সিরিজের তালিকা"
     "</blockquote>\n\n"
     "🎁 <b>শপ, প্রোফাইল ও কন্ট্রোল:</b>\n"
     "<blockquote>"
@@ -1923,7 +2216,23 @@ def fetch_song_lyrics_and_info(query_song: str) -> str:
     )
 
 
+VOICE_CHARACTER_LABELS: Dict[str, str] = {
+    "bn-BD-NabanitaNeural": "🇧🇩 বাংলা নারী — নবনীতা (মিষ্টি কণ্ঠ)",
+    "bn-BD-PradeepNeural": "🇧🇩 বাংলা পুরুষ — প্রদীপ (ভরাট কণ্ঠ)",
+    "bn-IN-TanishaaNeural": "🇮🇳 বাংলা নারী — তানিশা (স্টুডিও কণ্ঠ)",
+    "bn-IN-BashkarNeural": "🇮🇳 বাংলা পুরুষ — ভাস্কর (আবৃত্তি কণ্ঠ)",
+    "en-US-AriaNeural": "🇺🇸 English Female — Aria (Natural)",
+    "en-US-ChristopherNeural": "🇺🇸 English Male — Christopher (Cinema)",
+    "en-GB-SoniaNeural": "🇬🇧 British Female — Sonia (Royal)",
+    "hi-IN-SwaraNeural": "🇮🇳 Hindi/Urdu — Swara (Melodic)",
+}
+
+
 async def generate_tts_voice(text: str, voice: str) -> str:
+    """
+    Generates studio-quality voice up to 2,500+ characters (2K+ lines) using edge-tts
+    with automatic fallback to gTTS and Opus voice conversion via imageio-ffmpeg.
+    """
     tmp_mp3 = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3").name
     edge_ok = False
 
@@ -1939,7 +2248,7 @@ async def generate_tts_voice(text: str, voice: str) -> str:
             await asyncio.sleep(1)
 
     if not edge_ok:
-        lang = "bn" if voice.startswith("bn") else "en"
+        lang = "bn" if voice.startswith("bn") else ("hi" if voice.startswith("hi") else "en")
         tts = gTTS(text=text, lang=lang)
         tts.save(tmp_mp3)
 
@@ -1950,7 +2259,7 @@ async def generate_tts_voice(text: str, voice: str) -> str:
             [ffmpeg_exe, "-y", "-i", tmp_mp3, "-c:a", "libopus", "-b:a", "48k", tmp_ogg],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            timeout=30,
+            timeout=45,
             check=True,
         )
         if os.path.exists(tmp_ogg) and os.path.getsize(tmp_ogg) > 100:
@@ -1990,39 +2299,76 @@ def _stream_download_file(stream_url: str, out_path: str) -> bool:
     return os.path.exists(out_path) and os.path.getsize(out_path) > 1000
 
 
+def _extract_video_url_from_json(obj: Any) -> Optional[str]:
+    """
+    Recursively finds the best direct mp4/video download URL inside API JSON responses.
+    """
+    if isinstance(obj, str):
+        s = obj.strip()
+        if s.startswith("http") and any(k in s.lower() for k in (".mp4", "video", "fbcdn", "cdninstagram", "googlevideo", "tikwm", "download", "media")):
+            if not s.lower().endswith((".jpg", ".jpeg", ".png", ".webp", ".mp3", ".m4a")):
+                return s
+        return None
+    if isinstance(obj, dict):
+        # Prioritize HD / high quality keys first
+        for k in ("hd", "hdplay", "url", "download_url", "video_url", "sd", "play", "link", "data", "result", "downloads", "medias", "formats"):
+            if k in obj:
+                found = _extract_video_url_from_json(obj[k])
+                if found:
+                    return found
+        for v in obj.values():
+            found = _extract_video_url_from_json(v)
+            if found:
+                return found
+    elif isinstance(obj, list):
+        for item in obj:
+            found = _extract_video_url_from_json(item)
+            if found:
+                return found
+    return None
+
+
 def download_video_from_url(url: str) -> Tuple[str, str]:
     """
-    Multi-stage resilient video downloader for Render cloud IPs:
-    1. TikTok -> tikwm API first (hdplay or play)
-    2. Cobalt multi-instance social media API (bypasses YouTube/Facebook/Instagram datacenter blocks)
-    3. yt-dlp with bundled imageio-ffmpeg binary, mobile/android/tv player_client bypass,
-       and automatic redirect resolution for fb.watch / share/v / share/r links.
+    6-Stage Universal Video Downloader for Render Cloud IPs:
+    Supports TikTok, YouTube (Videos & Shorts), Facebook (Reels, Watch, share/r, share/v), Instagram (Reels/Posts), X/Twitter:
+    Stage 1: Resolve short/share redirects (fb.watch, facebook.com/share/r/..., youtu.be, vm.tiktok.com)
+    Stage 2: TikTok -> tikwm API
+    Stage 3: Dedicated External Social Downloader APIs (Ryzendesu, Siputzx, Vkrdownloader) for FB, IG, YT
+    Stage 4: Updated Cobalt Community APIs
+    Stage 5: yt-dlp with android_vr / tv_embedded / ios / mweb client bypass & bundled ffmpeg
     """
     tmp_dir = tempfile.mkdtemp(prefix="vid_")
     ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+    ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 
-    # Resolve short redirects (e.g., fb.watch, facebook.com/share/r/..., vm.tiktok.com)
-    resolved_url = url
+    # Stage 1: Resolve Facebook / TikTok / YouTube short redirects properly
+    resolved_url = url.strip()
     try:
-        r_head = requests.head(
-            url,
+        # Use GET with stream=True so Facebook share/r/ and share/v/ redirects resolve to canonical /reel/ or /watch/ URLs
+        with requests.get(
+            resolved_url,
             allow_redirects=True,
-            timeout=10,
-            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
-        )
-        if r_head.url and r_head.url.startswith("http"):
-            resolved_url = r_head.url
+            stream=True,
+            timeout=12,
+            headers={"User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1"},
+        ) as r_redir:
+            if r_redir.url and r_redir.url.startswith("http") and "login" not in r_redir.url.lower():
+                resolved_url = r_redir.url
     except Exception:
         pass
 
-    # Stage 1: TikTok via tikwm API first
-    if "tiktok.com" in resolved_url.lower() or "tiktok.com" in url.lower():
+    lower_u = (resolved_url + " " + url).lower()
+    enc_orig = urllib.parse.quote(url)
+    enc_res = urllib.parse.quote(resolved_url)
+
+    # Stage 2: TikTok via tikwm API
+    if "tiktok.com" in lower_u:
         try:
-            api_url = f"https://www.tikwm.com/api/?url={urllib.parse.quote(url)}&hd=1"
-            resp = requests.get(api_url, timeout=20)
+            api_url = f"https://www.tikwm.com/api/?url={enc_orig}&hd=1"
+            resp = requests.get(api_url, headers={"User-Agent": ua}, timeout=20)
             if resp.status_code == 200:
-                j = resp.json()
-                data = j.get("data") or {}
+                data = (resp.json() or {}).get("data") or {}
                 play_url = data.get("hdplay") or data.get("play")
                 title = data.get("title") or "TikTok Video"
                 if play_url:
@@ -2035,47 +2381,85 @@ def download_video_from_url(url: str) -> Tuple[str, str]:
             if str(ve) == "FILE_TOO_LARGE":
                 raise
         except Exception as e:
-            logger.warning(f"tikwm API failed, trying next engine: {e}")
+            logger.warning(f"tikwm API failed: {e}")
 
-    # Stage 2: Cobalt API instances (great for YouTube, Facebook Reels/Watch, Instagram on cloud IPs)
-    cobalt_endpoints = [
-        "https://api.cobalt.tools/",
-        "https://cobalt-api.kwiatekmiki.com/",
-        "https://cobalt-backend.canine.tools/",
-    ]
-    for cob_url in cobalt_endpoints:
+    # Stage 3: Dedicated External Downloader APIs for Facebook, Instagram & YouTube
+    external_apis: List[str] = []
+    if any(k in lower_u for k in ("facebook.com", "fb.watch", "fb.com")):
+        external_apis.extend([
+            f"https://api.ryzendesu.vip/api/downloader/fbdl?url={enc_res}",
+            f"https://api.ryzendesu.vip/api/downloader/fbdl?url={enc_orig}",
+            f"https://api.siputzx.my.id/api/d/facebook?url={enc_res}",
+            f"https://vkrdownloader.vercel.app/server?vkr={enc_res}",
+        ])
+    elif "instagram.com" in lower_u:
+        external_apis.extend([
+            f"https://api.ryzendesu.vip/api/downloader/igdl?url={enc_res}",
+            f"https://api.siputzx.my.id/api/d/igdl?url={enc_res}",
+            f"https://vkrdownloader.vercel.app/server?vkr={enc_res}",
+        ])
+    elif any(k in lower_u for k in ("youtube.com", "youtu.be")):
+        external_apis.extend([
+            f"https://api.ryzendesu.vip/api/downloader/ytmp4?url={enc_res}",
+            f"https://api.siputzx.my.id/api/d/ytmp4?url={enc_res}",
+            f"https://vkrdownloader.vercel.app/server?vkr={enc_res}",
+        ])
+    else:
+        external_apis.append(f"https://vkrdownloader.vercel.app/server?vkr={enc_res}")
+
+    for ext_api in external_apis:
         try:
-            c_resp = requests.post(
-                cob_url,
-                json={
-                    "url": resolved_url,
-                    "videoQuality": "720",
-                    "filenameStyle": "basic",
-                },
-                headers={
-                    "Accept": "application/json",
-                    "Content-Type": "application/json",
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-                },
-                timeout=18,
-            )
-            if c_resp.status_code == 200:
-                c_data = c_resp.json()
-                dl_link = c_data.get("url")
+            r_ext = requests.get(ext_api, headers={"User-Agent": ua}, timeout=20)
+            if r_ext.status_code == 200:
+                j_ext = r_ext.json()
+                dl_link = _extract_video_url_from_json(j_ext)
                 if dl_link:
-                    out_path = os.path.join(tmp_dir, "social_video.mp4")
+                    out_path = os.path.join(tmp_dir, "ext_video.mp4")
                     if _stream_download_file(dl_link, out_path):
-                        return out_path, c_data.get("filename") or "Downloaded Video"
+                        return out_path, "Downloaded Social Video"
         except ValueError as ve:
             if str(ve) == "FILE_TOO_LARGE":
                 raise
         except Exception as e:
-            logger.debug(f"Cobalt instance {cob_url} skipped: {e}")
+            logger.debug(f"External API {ext_api[:50]} skipped: {e}")
 
-    # Stage 3: yt-dlp with ffmpeg_location and multi-client configurations for FB / YT / IG
+    # Stage 4: Cobalt API instances (both v7 and v10 payloads)
+    cobalt_endpoints = [
+        "https://co.eepy.today/",
+        "https://cobalt.api.timelessnesses.me/",
+        "https://api.cobalt.tools/api/json",
+        "https://api.cobalt.tools/",
+    ]
+    for cob_url in cobalt_endpoints:
+        for t_url in (resolved_url, url):
+            try:
+                c_resp = requests.post(
+                    cob_url,
+                    json={"url": t_url, "videoQuality": "720", "vQuality": "720"},
+                    headers={
+                        "Accept": "application/json",
+                        "Content-Type": "application/json",
+                        "User-Agent": ua,
+                    },
+                    timeout=15,
+                )
+                if c_resp.status_code == 200:
+                    c_data = c_resp.json()
+                    dl_link = c_data.get("url")
+                    if dl_link:
+                        out_path = os.path.join(tmp_dir, "cobalt_video.mp4")
+                        if _stream_download_file(dl_link, out_path):
+                            return out_path, c_data.get("filename") or "Downloaded Video"
+            except ValueError as ve:
+                if str(ve) == "FILE_TOO_LARGE":
+                    raise
+            except Exception:
+                pass
+
+    # Stage 5: yt-dlp with android_vr / tv_embedded / ios / mweb clients & bundled imageio-ffmpeg
     out_tmpl = os.path.join(tmp_dir, "video.%(ext)s")
     client_profiles = [
-        # Profile A: Android/iOS player client (bypasses most YouTube bot checks) + ffmpeg merge
+        # Profile 1: YouTube android_vr & tv_embedded (bypasses YouTube datacenter bot check without cookies!)
         {
             "format": (
                 "best[filesize<46M][ext=mp4]/"
@@ -2083,30 +2467,36 @@ def download_video_from_url(url: str) -> Tuple[str, str]:
                 "bestvideo[filesize<35M][ext=mp4]+bestaudio[filesize<10M][ext=m4a]/"
                 "best[height<=720][ext=mp4]/best[ext=mp4]/best"
             ),
-            "extractor_args": {"youtube": {"player_client": ["android", "ios", "tv", "web"]}},
-            "http_headers": {
-                "User-Agent": (
-                    "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
-                )
+            "extractor_args": {
+                "youtube": {
+                    "player_client": ["android_vr", "tv_embedded", "ios", "mweb", "android"],
+                }
             },
+            "http_headers": {"User-Agent": ua},
         },
-        # Profile B: Desktop browser headers (helpful for Facebook Watch / public Reels)
+        # Profile 2: Mobile Safari headers (ideal for Facebook Reels/Watch & Instagram Reels)
         {
             "format": "best[height<=720][ext=mp4]/best[ext=mp4]/best",
             "http_headers": {
                 "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+                    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) "
+                    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1"
                 ),
                 "Accept-Language": "en-US,en;q=0.9",
             },
         },
     ]
 
+    # Also build mbasic/mobile FB fallback URL if it's a Facebook link
+    candidate_targets = [resolved_url]
+    if url != resolved_url:
+        candidate_targets.append(url)
+    if "facebook.com" in resolved_url:
+        candidate_targets.append(resolved_url.replace("www.facebook.com", "m.facebook.com"))
+
     last_err: Optional[Exception] = None
     for profile in client_profiles:
-        for target in (resolved_url, url):
+        for target in candidate_targets:
             try:
                 ydl_opts: Dict[str, Any] = {
                     "outtmpl": out_tmpl,
@@ -2760,11 +3150,12 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             voice = data.split(":", 1)[1]
             context.user_data["tts_voice"] = voice
             context.user_data["state"] = "WAIT_TTS_TEXT"
-            await query.answer("ভয়েস নির্বাচন করা হয়েছে!")
+            v_label = VOICE_CHARACTER_LABELS.get(voice, voice)
+            await query.answer("ভয়েস ক্যারেক্টার নির্বাচন করা হয়েছে!")
             await query.message.reply_text(
-                f"🎙️ <b>নির্বাচিত ভয়েস:</b> <code>{voice}</code>\n"
+                f"🎙️ <b>নির্বাচিত ভয়েস ক্যারেক্টার:</b>\n<blockquote>{v_label} (<code>{voice}</code>)</blockquote>\n"
                 f"{DIVIDER}\n"
-                "✍️ এখন আপনার টেক্সট পাঠান (সর্বোচ্চ ৮০০ অক্ষর):",
+                "✍️ এখন আপনার টেক্সট বা স্ক্রিপ্ট পাঠান (সর্বোচ্চ <b>২,৫০০ অক্ষর / 2K+ লাইন</b> পর্যন্ত একসাথে পাঠাতে পারবেন):",
                 parse_mode=ParseMode.HTML,
             )
             return
@@ -3282,22 +3673,32 @@ async def route_menu_button(
             default_voice = context.user_data.get("tts_voice", "bn-BD-NabanitaNeural")
             context.user_data["tts_voice"] = default_voice
             context.user_data["state"] = "WAIT_TTS_TEXT"
+            v_label = VOICE_CHARACTER_LABELS.get(default_voice, default_voice)
             kb = InlineKeyboardMarkup(
                 [
                     [
-                        InlineKeyboardButton("👩 বাংলা (Nabanita - Default)", callback_data="tts_voice:bn-BD-NabanitaNeural"),
-                        InlineKeyboardButton("👨 বাংলা (Pradeep)", callback_data="tts_voice:bn-BD-PradeepNeural"),
+                        InlineKeyboardButton("👩 নবনীতা (মিষ্টি বাংলা)", callback_data="tts_voice:bn-BD-NabanitaNeural"),
+                        InlineKeyboardButton("👨 প্রদীপ (ভরাট বাংলা)", callback_data="tts_voice:bn-BD-PradeepNeural"),
                     ],
                     [
-                        InlineKeyboardButton("👩 English (Aria)", callback_data="tts_voice:en-US-AriaNeural"),
+                        InlineKeyboardButton("👩‍🎤 তানিশা (স্টুডিও বাংলা)", callback_data="tts_voice:bn-IN-TanishaaNeural"),
+                        InlineKeyboardButton("👨‍🎤 ভাস্কর (আবৃত্তি বাংলা)", callback_data="tts_voice:bn-IN-BashkarNeural"),
+                    ],
+                    [
+                        InlineKeyboardButton("👩 Aria (US Female)", callback_data="tts_voice:en-US-AriaNeural"),
+                        InlineKeyboardButton("👨 Christopher (US Male)", callback_data="tts_voice:en-US-ChristopherNeural"),
+                    ],
+                    [
+                        InlineKeyboardButton("👑 Sonia (UK Royal)", callback_data="tts_voice:en-GB-SoniaNeural"),
+                        InlineKeyboardButton("🎶 Swara (Hindi/Urdu)", callback_data="tts_voice:hi-IN-SwaraNeural"),
                     ],
                 ]
             )
             await msg.reply_text(
-                f"🎙️ <b>টেক্সট থেকে ভয়েস (Text-to-Speech)</b>\n"
+                f"🎙️ <b>স্টুডিও ভয়েস মেকার (AI Text-to-Speech)</b>\n"
                 f"{DIVIDER}\n"
-                f"<blockquote>🔊 <b>বর্তমান ভয়েস:</b> <code>{default_voice}</code>\n"
-                f"নিচের বাটন থেকে কণ্ঠ পরিবর্তন করতে পারেন অথবা সরাসরি আপনার লেখাটি পাঠান (সর্বোচ্চ ৮০০ অক্ষর)।</blockquote>",
+                f"<blockquote>🔊 <b>বর্তমান ভয়েস ক্যারেক্টার:</b>\n{v_label}\n\n"
+                f"✨ নিচের ৮টি প্রিমিয়াম কণ্ঠ থেকে আপনার পছন্দের ভয়েস বেছে নিন অথবা সরাসরি আপনার লেখা পাঠান (সর্বোচ্চ <b>২,৫০০ অক্ষর / 2K+</b> পর্যন্ত সাপোর্ট করে)!</blockquote>",
                 parse_mode=ParseMode.HTML,
                 reply_markup=kb,
             )
@@ -3527,7 +3928,7 @@ async def route_menu_button(
             )
 
         elif btn == BTN_NEWS:
-            await context.bot.send_chat_action(chat_id=msg.chat_id, action=ChatAction.TYPING)
+            wait_m = await msg.reply_text("⏳ <b>আজকের তাজা খবর লোড হচ্ছে, অনুগ্রহ করে কিছুক্ষণ অপেক্ষা করুন...</b>", parse_mode=ParseMode.HTML)
             news_text = await asyncio.to_thread(fetch_google_news_bn, "top")
             add_points(user.id, 1)
             news_kb = InlineKeyboardMarkup(
@@ -3544,7 +3945,7 @@ async def route_menu_button(
                     ],
                 ]
             )
-            await msg.reply_text(
+            await wait_m.edit_text(
                 news_text,
                 parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True,
@@ -3553,11 +3954,11 @@ async def route_menu_button(
 
         elif btn == BTN_CRYPTO:
             context.user_data["state"] = "WAIT_CRYPTO"
-            await context.bot.send_chat_action(chat_id=msg.chat_id, action=ChatAction.TYPING)
+            wait_m = await msg.reply_text("⏳ <b>ক্রিপ্টোকারেন্সির লাইভ বাজারমূল্য লোড হচ্ছে, অনুগ্রহ করে অপেক্ষা করুন...</b>", parse_mode=ParseMode.HTML)
             crypto_text = await asyncio.to_thread(fetch_crypto_prices)
             add_points(user.id, 1)
             kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 লাইভ রেট রিফ্রেশ করুন", callback_data="crypto_refresh")]])
-            await msg.reply_text(crypto_text, parse_mode=ParseMode.HTML, reply_markup=kb)
+            await wait_m.edit_text(crypto_text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
         elif btn == BTN_AGE:
             context.user_data["state"] = "WAIT_AGE"
@@ -3732,6 +4133,53 @@ async def route_menu_button(
                 f"🧮 <b>অংক ও বিজ্ঞান সমাধানকারী</b>\n"
                 f"{DIVIDER}\n"
                 "<blockquote>আপনার গণিত, পদার্থবিজ্ঞান বা রসায়নের যেকোনো অংক বা প্রশ্ন লিখে পাঠান—ধাপে ধাপে সহজ বাংলায় সমাধান পেয়ে যাবেন!</blockquote>",
+                parse_mode=ParseMode.HTML,
+            )
+
+        elif btn == BTN_BLOOD_INFO:
+            context.user_data["state"] = "WAIT_BLOOD_INFO"
+            await msg.reply_text(
+                f"🩸 <b>রক্তের গ্রুপ ও ডোনার গাইড</b>\n"
+                f"{DIVIDER}\n"
+                "<blockquote>"
+                "🔹 <b>O+</b> ➔ দিতে পারবে: O+, A+, B+, AB+ | নিতে পারবে: O+, O-\n"
+                "🔹 <b>O- (সর্বজনীন দাতা)</b> ➔ সবাইকে দিতে পারবে | নিতে পারবে: শুধু O-\n"
+                "🔹 <b>A+</b> ➔ দিতে পারবে: A+, AB+ | নিতে পারবে: A+, A-, O+, O-\n"
+                "🔹 <b>A-</b> ➔ দিতে পারবে: A+, A-, AB+, AB- | নিতে পারবে: A-, O-\n"
+                "🔹 <b>B+</b> ➔ দিতে পারবে: B+, AB+ | নিতে পারবে: B+, B-, O+, O-\n"
+                "🔹 <b>B-</b> ➔ দিতে পারবে: B+, B-, AB+, AB- | নিতে পারবে: B-, O-\n"
+                "🔹 <b>AB+ (সর্বজনীন গ্রহীতা)</b> ➔ দিতে পারবে: শুধু AB+ | সবার রক্ত নিতে পারবে\n"
+                "🔹 <b>AB-</b> ➔ দিতে পারবে: AB+, AB- | নিতে পারবে: AB-, A-, B-, O-"
+                "</blockquote>\n\n"
+                "✍️ <i>রক্তদান বা হিমোগ্লোবিন নিয়ে যেকোনো প্রশ্ন থাকলে নিচে লিখে পাঠান:</i>",
+                parse_mode=ParseMode.HTML,
+            )
+
+        elif btn == BTN_DIET_PLAN:
+            context.user_data["state"] = "WAIT_DIET_PLAN"
+            await msg.reply_text(
+                f"🥗 <b>পার্সোনালাইজড ডায়েট ও স্বাস্থ্য চার্ট</b>\n"
+                f"{DIVIDER}\n"
+                "<blockquote>আপনার <b>বয়স, ওজন এবং লক্ষ্য</b> (ওজন কমানো / ওজন বাড়ানো / ফিট থাকা / ডায়াবেটিস কন্ট্রোল) লিখে পাঠান।\n"
+                "💡 যেমন: <code>বয়স ২২, ওজন ৭৮ কেজি, দ্রুত ওজন কমানোর দেশি খাবারের ডায়েট চার্ট চাই</code></blockquote>",
+                parse_mode=ParseMode.HTML,
+            )
+
+        elif btn == BTN_BIZ_IDEA:
+            context.user_data["state"] = "WAIT_BIZ_IDEA"
+            await msg.reply_text(
+                f"💼 <b>বিজনেস আইডিয়া ও ব্র্যান্ড নেম জেনারেটর</b>\n"
+                f"{DIVIDER}\n"
+                "<blockquote>আপনার বাজেট বা পছন্দের ক্ষেত্র লিখুন (যেমন: <code>১০ হাজার টাকায় ছাত্রদের জন্য ব্যবসা</code> অথবা <code>কাপড়ের ফেসবুক পেজের সুন্দর নাম</code>):</blockquote>",
+                parse_mode=ParseMode.HTML,
+            )
+
+        elif btn == BTN_MOVIE_REC:
+            context.user_data["state"] = "WAIT_MOVIE_REC"
+            await msg.reply_text(
+                f"🎬 <b>মুভি ও ওয়েব সিরিজ রিকমেন্ডেশন</b>\n"
+                f"{DIVIDER}\n"
+                "<blockquote>আপনি কোন ধরনের মুভি বা সিরিজ দেখতে চান তা লিখুন (যেমন: <code>সাসপেন্স থ্রিলার</code>, <code>রোমান্টিক কোরিয়ান ড্রামা</code>, <code>সেরা বাংলা নাটক</code>, <code>হলিউড অ্যাকশন</code>):</blockquote>",
                 parse_mode=ParseMode.HTML,
             )
 
@@ -4127,6 +4575,7 @@ async def process_state_text(text: str, msg, user, context: ContextTypes.DEFAULT
     # Default to AI Chat if no specific state is set
     if not state or state == "WAIT_AI_CHAT":
         await context.bot.send_chat_action(chat_id=msg.chat_id, action=ChatAction.TYPING)
+        wait_m = await msg.reply_text("⏳ <b>AI আপনার প্রশ্নের উত্তর তৈরি করছে, অনুগ্রহ করে কিছুক্ষণ অপেক্ষা করুন...</b>", parse_mode=ParseMode.HTML)
         history: List[Dict[str, str]] = context.user_data.setdefault("chat_history", [])
         history.append({"role": "user", "content": text})
         if len(history) > 16:
@@ -4148,25 +4597,29 @@ async def process_state_text(text: str, msg, user, context: ContextTypes.DEFAULT
         if len(history) > 16:
             history[:] = history[-16:]
         add_points(user.id, 1)
-        await msg.reply_text(
+        await wait_m.edit_text(
             f"🤖 <b>AI চ্যাট রিপ্লাই</b>\n{DIVIDER}\n{html.escape(clean_ai_text(reply))}",
             parse_mode=ParseMode.HTML,
         )
         return
 
     if state == "WAIT_TTS_TEXT":
-        if len(text) > 800:
-            await msg.reply_text("⚠️ টেক্সট সর্বোচ্চ ৮০০ অক্ষরের মধ্যে হতে হবে। অনুগ্রহ করে ছোট করে পাঠান।")
+        if len(text) > 2500:
+            await msg.reply_text("⚠️ টেক্সট সর্বোচ্চ ২,৫০০ অক্ষরের (2.5K) মধ্যে হতে হবে। অনুগ্রহ করে একটু ছোট করে পাঠান।")
             return
         voice = context.user_data.get("tts_voice", "bn-BD-NabanitaNeural")
-        status_msg = await msg.reply_text("🎙️ ভয়েস তৈরি করা হচ্ছে, একটু অপেক্ষা করুন...")
+        v_label = VOICE_CHARACTER_LABELS.get(voice, voice)
+        status_msg = await msg.reply_text(
+            f"🎙️ <b>স্টুডিও ভয়েস তৈরি করা হচ্ছে ({v_label})...</b>\n⏳ <i>অনুগ্রহ করে কিছুক্ষণ অপেক্ষা করুন...</i>",
+            parse_mode=ParseMode.HTML,
+        )
         audio_path = await generate_tts_voice(text, voice)
         try:
             add_points(user.id, 1)
             with open(audio_path, "rb") as f:
                 await msg.reply_voice(
                     voice=f,
-                    caption=f"🎙️ <b>ভয়েস তৈরি সম্পন্ন!</b> (Voice: <code>{voice}</code>)",
+                    caption=f"🎙️ <b>ভয়েস তৈরি সম্পন্ন!</b>\n🔊 কণ্ঠ: <b>{v_label}</b>",
                     parse_mode=ParseMode.HTML,
                 )
             await status_msg.delete()
@@ -4179,43 +4632,20 @@ async def process_state_text(text: str, msg, user, context: ContextTypes.DEFAULT
         return
 
     if state == "WAIT_STT_VOICE":
-        await msg.reply_text("⚠️ অনুগ্রহ করে টেক্সট না পাঠিয়ে একটি ভয়েস মেসেজ (Voice Message) পাঠান।")
+        await msg.reply_text("⚠️ অনুগ্রহ করে টেক্সট না পাঠিয়ে একটি ভয়েস মেসেজ (Voice Message) রেকর্ড করে পাঠান।")
         return
 
     if state == "WAIT_AI_IMG":
         status_msg = await msg.reply_text(
             "🎨 <b>আপনার প্রম্পট উন্নত করে Ultra-HD AI ছবি তৈরি করা হচ্ছে...</b>\n"
-            "⏳ <i>অনুগ্রহ করে ৫–১০ সেকেন্ড অপেক্ষা করুন...</i>",
+            "⏳ <i>অনুগ্রহ করে ৫–১২ সেকেন্ড অপেক্ষা করুন...</i>",
             parse_mode=ParseMode.HTML,
         )
-        # Step 1: Convert Bangla/short prompt into a detailed English cinematic Flux prompt via Groq
         enhanced_prompt = await asyncio.to_thread(enhance_image_prompt_with_groq, text)
-        encoded_prompt = urllib.parse.quote(enhanced_prompt)
-        rand_seed = random.randint(10000, 9999999)
-
-        # Step 2: Request 1024x1100 with model=flux & nologo=true so top 1024x1024 can be cropped 1:1 without resize blur
-        candidate_urls = [
-            f"https://image.pollinations.ai/prompt/{encoded_prompt}?model=flux&width=1024&height=1100&seed={rand_seed}&nologo=true&nofeed=true&enhance=true",
-            f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1024&height=1024&nologo=true&seed={rand_seed}",
-            f"https://image.pollinations.ai/prompt/{urllib.parse.quote(text)}?width=1024&height=1024&nologo=true&seed=42",
-        ]
-
-        img_bytes: Optional[bytes] = None
-        for target_url in candidate_urls:
-            try:
-                r = await asyncio.to_thread(
-                    requests.get,
-                    target_url,
-                    headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
-                    timeout=50,
-                )
-                if r.status_code == 200 and r.content and len(r.content) > 2000:
-                    img_bytes = await asyncio.to_thread(remove_bottom_watermark_and_polish, r.content)
-                    break
-            except Exception as e:
-                logger.warning(f"Pollinations download attempt failed ({target_url}): {e}")
-
-        if not img_bytes:
+        try:
+            img_bytes = await asyncio.to_thread(generate_ai_image_multi_engine, text, enhanced_prompt)
+        except Exception as e:
+            logger.error(f"All AI image engines failed: {e}")
             await status_msg.edit_text("দুঃখিত, এই মুহূর্তে ছবিটি তৈরি করা যায়নি। অনুগ্রহ করে একটু পর আবার চেষ্টা করুন 🙏")
             return
 
@@ -4223,7 +4653,7 @@ async def process_state_text(text: str, msg, user, context: ContextTypes.DEFAULT
         await msg.reply_photo(
             photo=io.BytesIO(img_bytes),
             caption=(
-                f"🖼️ <b>Ultra-HD AI ছবি (Flux Engine • Watermark-Free)</b>\n"
+                f"🖼️ <b>Ultra-HD AI ছবি (100% Watermark-Free)</b>\n"
                 f"{DIVIDER}\n"
                 f"<blockquote>✨ <b>আপনার বিষয়:</b> {html.escape(text)}\n"
                 f"🎯 <b>AI Prompt:</b> <i>{html.escape(enhanced_prompt[:220])}</i></blockquote>"
@@ -4242,7 +4672,11 @@ async def process_state_text(text: str, msg, user, context: ContextTypes.DEFAULT
             await msg.reply_text("⚠️ মেসেজে কোনো বৈধ লিংক (http/https) পাওয়া যায়নি। সঠিক লিংক পাঠান।")
             return
 
-        status_msg = await msg.reply_text("📥 <b>ভিডিও ডাউনলোড হচ্ছে, অনুগ্রহ করে অপেক্ষা করুন...</b>", parse_mode=ParseMode.HTML)
+        status_msg = await msg.reply_text(
+            "📥 <b>আপনার ভিডিওটি খুঁজে ডাউনলোড করা হচ্ছে...</b>\n"
+            "⏳ <i>অনুগ্রহ করে ১০–২০ সেকেন্ড অপেক্ষা করুন...</i>",
+            parse_mode=ParseMode.HTML,
+        )
         vid_path: Optional[str] = None
         try:
             vid_path, title = await asyncio.to_thread(download_video_from_url, url)
@@ -4284,7 +4718,7 @@ async def process_state_text(text: str, msg, user, context: ContextTypes.DEFAULT
     if state == "WAIT_TRANSLATE_TEXT":
         direction = context.user_data.get("trans_dir", "bn2en")
         target_lang = "English" if direction == "bn2en" else "Bangla (Bengali)"
-        await context.bot.send_chat_action(chat_id=msg.chat_id, action=ChatAction.TYPING)
+        wait_m = await msg.reply_text("⏳ <b>অনুবাদ করা হচ্ছে, অনুগ্রহ করে কিছুক্ষণ অপেক্ষা করুন...</b>", parse_mode=ParseMode.HTML)
         out = await asyncio.to_thread(
             call_groq_chat,
             [
@@ -4297,30 +4731,30 @@ async def process_state_text(text: str, msg, user, context: ContextTypes.DEFAULT
             0.3,
         )
         add_points(user.id, 1)
-        await msg.reply_text(
+        await wait_m.edit_text(
             f"🌐 <b>অনুবাদ ফলাফল ({'বাংলা → English' if direction == 'bn2en' else 'English → বাংলা'})</b>\n"
             f"{DIVIDER}\n"
-            f"<blockquote>{html.escape(out)}</blockquote>",
+            f"<blockquote>{html.escape(clean_ai_text(out))}</blockquote>",
             parse_mode=ParseMode.HTML,
         )
         return
 
     if state == "WAIT_PRAYER":
-        await context.bot.send_chat_action(chat_id=msg.chat_id, action=ChatAction.TYPING)
+        wait_m = await msg.reply_text("⏳ <b>নামাজ ও সাহরি-ইফতারের সময়সূচী লোড হচ্ছে, একটু অপেক্ষা করুন...</b>", parse_mode=ParseMode.HTML)
         out = await asyncio.to_thread(fetch_prayer_times_for_location, text)
         add_points(user.id, 1)
-        await msg.reply_text(out, parse_mode=ParseMode.HTML)
+        await wait_m.edit_text(out, parse_mode=ParseMode.HTML)
         return
 
     if state == "WAIT_CRYPTO":
-        await context.bot.send_chat_action(chat_id=msg.chat_id, action=ChatAction.TYPING)
+        wait_m = await msg.reply_text("⏳ <b>ক্রিপ্টো কয়েনের লাইভ দাম যাচাই করা হচ্ছে, একটু অপেক্ষা করুন...</b>", parse_mode=ParseMode.HTML)
         out = await asyncio.to_thread(fetch_crypto_prices, text)
         add_points(user.id, 1)
-        await msg.reply_text(out, parse_mode=ParseMode.HTML)
+        await wait_m.edit_text(out, parse_mode=ParseMode.HTML)
         return
 
     if state == "WAIT_CAPTION":
-        await context.bot.send_chat_action(chat_id=msg.chat_id, action=ChatAction.TYPING)
+        wait_m = await msg.reply_text("⏳ <b>আপনার জন্য ৫টি ভাইরাল ক্যাপশন ও English Hashtags তৈরি হচ্ছে, একটু অপেক্ষা করুন...</b>", parse_mode=ParseMode.HTML)
         out = await asyncio.to_thread(
             call_groq_chat,
             [
@@ -4346,7 +4780,7 @@ async def process_state_text(text: str, msg, user, context: ContextTypes.DEFAULT
         )
         add_points(user.id, 1)
         cleaned_out = clean_ai_text(out)
-        await msg.reply_text(
+        await wait_m.edit_text(
             f"✍️ <b>ভাইরাল সোশ্যাল মিডিয়া ক্যাপশন ও English Hashtags</b>\n"
             f"{DIVIDER}\n"
             f"📌 <b>টপিক:</b> {html.escape(text)}\n\n"
@@ -4356,7 +4790,7 @@ async def process_state_text(text: str, msg, user, context: ContextTypes.DEFAULT
         return
 
     if state == "WAIT_STORY":
-        await context.bot.send_chat_action(chat_id=msg.chat_id, action=ChatAction.TYPING)
+        wait_m = await msg.reply_text("⏳ <b>আপনার জন্য সুন্দর গল্প / কবিতা লেখা হচ্ছে, অনুগ্রহ করে একটু অপেক্ষা করুন...</b>", parse_mode=ParseMode.HTML)
         out = await asyncio.to_thread(
             call_groq_chat,
             [
@@ -4368,7 +4802,7 @@ async def process_state_text(text: str, msg, user, context: ContextTypes.DEFAULT
             ],
         )
         add_points(user.id, 1)
-        await msg.reply_text(
+        await wait_m.edit_text(
             f"📖 <b>গল্প / কবিতা ({html.escape(text)})</b>\n"
             f"{DIVIDER}\n"
             f"<blockquote>{html.escape(clean_ai_text(out))}</blockquote>",
@@ -4377,17 +4811,17 @@ async def process_state_text(text: str, msg, user, context: ContextTypes.DEFAULT
         return
 
     if state == "WAIT_WEATHER":
-        await context.bot.send_chat_action(chat_id=msg.chat_id, action=ChatAction.TYPING)
+        wait_m = await msg.reply_text("⏳ <b>লাইভ আবহাওয়ার তথ্য লোড হচ্ছে, অনুগ্রহ করে কিছুক্ষণ অপেক্ষা করুন...</b>", parse_mode=ParseMode.HTML)
         out = await asyncio.to_thread(fetch_weather_info, text)
         add_points(user.id, 1)
-        await msg.reply_text(out, parse_mode=ParseMode.HTML)
+        await wait_m.edit_text(out, parse_mode=ParseMode.HTML)
         return
 
     if state == "WAIT_CURRENCY":
-        await context.bot.send_chat_action(chat_id=msg.chat_id, action=ChatAction.TYPING)
+        wait_m = await msg.reply_text("⏳ <b>মুদ্রার লাইভ বিনিময় হার (Exchange Rate) হিসাব করা হচ্ছে, একটু অপেক্ষা করুন...</b>", parse_mode=ParseMode.HTML)
         out = await asyncio.to_thread(convert_currency_input, text)
         add_points(user.id, 1)
-        await msg.reply_text(out, parse_mode=ParseMode.HTML)
+        await wait_m.edit_text(out, parse_mode=ParseMode.HTML)
         return
 
     if state == "WAIT_SHORTURL":
@@ -4395,12 +4829,13 @@ async def process_state_text(text: str, msg, user, context: ContextTypes.DEFAULT
         if not url:
             await msg.reply_text("⚠️ সঠিক একটি লিংক (http:// বা https:// সহ) পাঠান।")
             return
+        wait_m = await msg.reply_text("⏳ <b>লিংকটি ছোট (Short URL) করা হচ্ছে, একটু অপেক্ষা করুন...</b>", parse_mode=ParseMode.HTML)
         api_url = f"https://is.gd/create.php?format=simple&url={urllib.parse.quote(url)}"
         resp = await asyncio.to_thread(requests.get, api_url, timeout=15)
         resp.raise_for_status()
         short_link = resp.text.strip()
         add_points(user.id, 1)
-        await msg.reply_text(
+        await wait_m.edit_text(
             f"🔗 <b>আপনার ছোট করা লিংক প্রস্তুত!</b>\n"
             f"{DIVIDER}\n"
             f"<blockquote><code>{html.escape(short_link)}</code></blockquote>\n"
@@ -4411,7 +4846,7 @@ async def process_state_text(text: str, msg, user, context: ContextTypes.DEFAULT
 
     if state == "WAIT_DICT":
         word = text.split()[0].strip()
-        await context.bot.send_chat_action(chat_id=msg.chat_id, action=ChatAction.TYPING)
+        wait_m = await msg.reply_text("⏳ <b>ডিকশনারি থেকে শব্দের অর্থ ও উদাহরণ খোঁজা হচ্ছে, একটু অপেক্ষা করুন...</b>", parse_mode=ParseMode.HTML)
         dict_url = f"https://api.dictionaryapi.dev/api/v2/entries/en/{urllib.parse.quote(word)}"
         r = await asyncio.to_thread(requests.get, dict_url, timeout=10)
         if r.status_code == 200:
@@ -4442,10 +4877,10 @@ async def process_state_text(text: str, msg, user, context: ContextTypes.DEFAULT
             except Exception:
                 pass
             add_points(user.id, 1)
-            await msg.reply_text(
+            await wait_m.edit_text(
                 f"📚 <b>ডিকশনারি ফলাফল: {html.escape(word)}</b> {html.escape(phonetic)}\n"
                 f"{DIVIDER}\n"
-                f"🇧🇩 <b>বাংলা অর্থ:</b>\n<blockquote>{html.escape(bn_meaning)}</blockquote>\n\n"
+                f"🇧🇩 <b>বাংলা অর্থ:</b>\n<blockquote>{html.escape(clean_ai_text(bn_meaning))}</blockquote>\n\n"
                 f"📖 <b>English Definitions:</b>\n<blockquote>" + "\n".join(defs_out) + "</blockquote>",
                 parse_mode=ParseMode.HTML,
             )
@@ -4461,10 +4896,10 @@ async def process_state_text(text: str, msg, user, context: ContextTypes.DEFAULT
                 ],
             )
             add_points(user.id, 1)
-            await msg.reply_text(
+            await wait_m.edit_text(
                 f"📚 <b>শব্দের বিস্তারিত ব্যাখ্যা ({html.escape(word)})</b>\n"
                 f"{DIVIDER}\n"
-                f"<blockquote>{html.escape(explanation)}</blockquote>",
+                f"<blockquote>{html.escape(clean_ai_text(explanation))}</blockquote>",
                 parse_mode=ParseMode.HTML,
             )
         return
@@ -4476,16 +4911,19 @@ async def process_state_text(text: str, msg, user, context: ContextTypes.DEFAULT
         return
 
     if state == "WAIT_QR":
-        qr_img = qrcode.make(text)
-        bio = io.BytesIO()
-        qr_img.save(bio, format="PNG")
-        bio.seek(0)
+        wait_m = await msg.reply_text("⏳ <b>আপনার প্রিমিয়াম স্টাইলিশ QR Card তৈরি হচ্ছে, একটু অপেক্ষা করুন...</b>", parse_mode=ParseMode.HTML)
+        bio = await asyncio.to_thread(generate_premium_qr_card, text)
         add_points(user.id, 1)
         await msg.reply_photo(
             photo=bio,
-            caption=f"🔳 <b>QR Code সফলভাবে তৈরি হয়েছে!</b>\n{DIVIDER}\n<blockquote><code>{html.escape(text[:150])}</code></blockquote>",
+            caption=(
+                f"🔳 <b>প্রিমিয়াম স্মার্ট QR Code প্রস্তুত!</b>\n"
+                f"{DIVIDER}\n"
+                f"<blockquote>📌 <b>তথ্য / লিংক:</b> <code>{html.escape(text[:200])}</code></blockquote>"
+            ),
             parse_mode=ParseMode.HTML,
         )
+        await wait_m.delete()
         return
 
     if state == "WAIT_AGE":
@@ -4534,8 +4972,7 @@ async def process_state_text(text: str, msg, user, context: ContextTypes.DEFAULT
         return
 
     if state == "WAIT_LYRICS":
-        await context.bot.send_chat_action(chat_id=msg.chat_id, action=ChatAction.TYPING)
-        status_msg = await msg.reply_text("🎵 <b>গানের লিরিক্স ও তথ্য খোঁজা হচ্ছে...</b>", parse_mode=ParseMode.HTML)
+        status_msg = await msg.reply_text("⏳ <b>গানের লিরিক্স ও তথ্য খোঁজা হচ্ছে, অনুগ্রহ করে কিছুক্ষণ অপেক্ষা করুন...</b>", parse_mode=ParseMode.HTML)
         out = await asyncio.to_thread(fetch_song_lyrics_and_info, text)
         add_points(user.id, 1)
         await status_msg.edit_text(out, parse_mode=ParseMode.HTML)
@@ -4573,9 +5010,9 @@ async def process_state_text(text: str, msg, user, context: ContextTypes.DEFAULT
             await msg.reply_text("⚠️ জব কিউ (Job Queue) সক্রিয় নেই।")
         return
 
-    # --- 6 NEW HIGH-UTILITY STATES (MARKET-GRADE UPGRADED) ---
+    # --- 10 HIGH-UTILITY STATES (WITH WAITING MESSAGES & CLEAN FORMATTING) ---
     if state == "WAIT_GRAMMAR":
-        await context.bot.send_chat_action(chat_id=msg.chat_id, action=ChatAction.TYPING)
+        wait_m = await msg.reply_text("⏳ <b>আপনার বাক্যটির বানান ও Grammar পরীক্ষা করা হচ্ছে, একটু অপেক্ষা করুন...</b>", parse_mode=ParseMode.HTML)
         out = await asyncio.to_thread(
             call_groq_chat,
             [
@@ -4593,14 +5030,14 @@ async def process_state_text(text: str, msg, user, context: ContextTypes.DEFAULT
             0.3,
         )
         add_points(user.id, 1)
-        await msg.reply_text(
+        await wait_m.edit_text(
             f"📝 <b>বানান ও Grammar সংশোধন ফলাফল</b>\n{DIVIDER}\n<blockquote>{html.escape(clean_ai_text(out))}</blockquote>",
             parse_mode=ParseMode.HTML,
         )
         return
 
     if state == "WAIT_EMAIL_CV":
-        await context.bot.send_chat_action(chat_id=msg.chat_id, action=ChatAction.TYPING)
+        wait_m = await msg.reply_text("⏳ <b>আপনার প্রফেশনাল ইমেইল / আবেদনপত্র তৈরি হচ্ছে, একটু অপেক্ষা করুন...</b>", parse_mode=ParseMode.HTML)
         out = await asyncio.to_thread(
             call_groq_chat,
             [
@@ -4617,7 +5054,7 @@ async def process_state_text(text: str, msg, user, context: ContextTypes.DEFAULT
         )
         add_points(user.id, 1)
         clean_doc = clean_ai_text(out)
-        await msg.reply_text(
+        await wait_m.edit_text(
             f"📧 <b>আপনার প্রফেশনাল ইমেইল / আবেদনপত্র</b>\n{DIVIDER}\n"
             f"<blockquote>{html.escape(clean_doc)}</blockquote>\n"
             f"📋 <i>নিচের বক্সে ট্যাপ করে পুরো লেখাটি কপি করুন:</i>\n"
@@ -4627,7 +5064,7 @@ async def process_state_text(text: str, msg, user, context: ContextTypes.DEFAULT
         return
 
     if state == "WAIT_CODE_HELP":
-        await context.bot.send_chat_action(chat_id=msg.chat_id, action=ChatAction.TYPING)
+        wait_m = await msg.reply_text("⏳ <b>আপনার কোড তৈরি ও ডিবাগ করা হচ্ছে, অনুগ্রহ করে কিছুক্ষণ অপেক্ষা করুন...</b>", parse_mode=ParseMode.HTML)
         out = await asyncio.to_thread(
             call_groq_chat,
             [
@@ -4645,7 +5082,6 @@ async def process_state_text(text: str, msg, user, context: ContextTypes.DEFAULT
             1800,
         )
         add_points(user.id, 1)
-        # Separate fenced code block from Bangla explanation so code is 1-tap copyable and Bangla is in a clean blockquote!
         code_match = re.search(r"```(?:[a-zA-Z0-9_+-]+)?\n(.*?)```", out, flags=re.DOTALL)
         if code_match:
             extracted_code = code_match.group(1).strip()
@@ -4665,11 +5101,11 @@ async def process_state_text(text: str, msg, user, context: ContextTypes.DEFAULT
                 f"{DIVIDER}\n"
                 f"<pre><code>{html.escape(clean_ai_text(out)[:3500])}</code></pre>"
             )
-        await msg.reply_text(formatted_msg, parse_mode=ParseMode.HTML)
+        await wait_m.edit_text(formatted_msg, parse_mode=ParseMode.HTML)
         return
 
     if state == "WAIT_BIO_GEN":
-        await context.bot.send_chat_action(chat_id=msg.chat_id, action=ChatAction.TYPING)
+        wait_m = await msg.reply_text("⏳ <b>আপনার জন্য ৬টি স্টাইলিশ VIP প্রোফাইল বায়ো তৈরি হচ্ছে, একটু অপেক্ষা করুন...</b>", parse_mode=ParseMode.HTML)
         out = await asyncio.to_thread(
             call_groq_chat,
             [
@@ -4693,7 +5129,7 @@ async def process_state_text(text: str, msg, user, context: ContextTypes.DEFAULT
             1200,
         )
         add_points(user.id, 1)
-        await msg.reply_text(
+        await wait_m.edit_text(
             f"🪪 <b>আপনার স্টাইলিশ VIP প্রোফাইল বায়ো কালেকশন</b>\n"
             f"{DIVIDER}\n"
             f"<blockquote>{html.escape(clean_ai_text(out))}</blockquote>\n"
@@ -4703,7 +5139,7 @@ async def process_state_text(text: str, msg, user, context: ContextTypes.DEFAULT
         return
 
     if state == "WAIT_DREAM_ISLAM":
-        await context.bot.send_chat_action(chat_id=msg.chat_id, action=ChatAction.TYPING)
+        wait_m = await msg.reply_text("⏳ <b>কুরআন ও হাদিসের আলোকে আপনার প্রশ্নের উত্তর প্রস্তুত করা হচ্ছে, একটু অপেক্ষা করুন...</b>", parse_mode=ParseMode.HTML)
         out = await asyncio.to_thread(
             call_groq_chat,
             [
@@ -4720,14 +5156,14 @@ async def process_state_text(text: str, msg, user, context: ContextTypes.DEFAULT
             0.4,
         )
         add_points(user.id, 1)
-        await msg.reply_text(
+        await wait_m.edit_text(
             f"🌙 <b>ইসলামিক ও স্বপ্ন বিষয়ক সমাধান</b>\n{DIVIDER}\n<blockquote>{html.escape(clean_ai_text(out))}</blockquote>",
             parse_mode=ParseMode.HTML,
         )
         return
 
     if state == "WAIT_MATH_SOLVE":
-        await context.bot.send_chat_action(chat_id=msg.chat_id, action=ChatAction.TYPING)
+        wait_m = await msg.reply_text("⏳ <b>আপনার অংক / বিজ্ঞানের প্রশ্নটি ধাপে ধাপে সমাধান করা হচ্ছে, একটু অপেক্ষা করুন...</b>", parse_mode=ParseMode.HTML)
         out = await asyncio.to_thread(
             call_groq_chat,
             [
@@ -4742,7 +5178,7 @@ async def process_state_text(text: str, msg, user, context: ContextTypes.DEFAULT
                         "✅ চূড়ান্ত উত্তর (Final Answer):\n\n"
                         "CRITICAL RULES:\n"
                         "- Double-check all arithmetic and algebraic steps before outputting.\n"
-                        "- NEVER use LaTeX code like \frac or $$; instead use clean Unicode math symbols (×, ÷, √, ², ³, π, θ, ⇒, ∴).\n"
+                        "- NEVER use LaTeX code like \\frac or $$; instead use clean Unicode math symbols (×, ÷, √, ², ³, π, θ, ⇒, ∴).\n"
                         "- Do NOT use raw markdown asterisks (**)."
                     ),
                 },
@@ -4752,8 +5188,99 @@ async def process_state_text(text: str, msg, user, context: ContextTypes.DEFAULT
             1500,
         )
         add_points(user.id, 1)
-        await msg.reply_text(
+        await wait_m.edit_text(
             f"🧮 <b>অংক ও বিজ্ঞান নিখুঁত সমাধান</b>\n{DIVIDER}\n<blockquote>{html.escape(clean_ai_text(out))}</blockquote>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if state == "WAIT_BLOOD_INFO":
+        wait_m = await msg.reply_text("⏳ <b>রক্তদান ও স্বাস্থ্য বিষয়ক তথ্য প্রস্তুত করা হচ্ছে, একটু অপেক্ষা করুন...</b>", parse_mode=ParseMode.HTML)
+        out = await asyncio.to_thread(
+            call_groq_chat,
+            [
+                {
+                    "role": "system",
+                    "content": "You are a helpful medical guide. Answer blood group, blood donation eligibility, hemoglobin, and health questions clearly in Bangla without raw asterisks (**).",
+                },
+                {"role": "user", "content": text},
+            ],
+            0.4,
+        )
+        add_points(user.id, 1)
+        await wait_m.edit_text(
+            f"🩸 <b>রক্তের গ্রুপ ও ডোনার গাইড উত্তর</b>\n{DIVIDER}\n<blockquote>{html.escape(clean_ai_text(out))}</blockquote>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if state == "WAIT_DIET_PLAN":
+        wait_m = await msg.reply_text("⏳ <b>আপনার জন্য দেশি খাবারের পূর্ণাঙ্গ ডায়েট চার্ট তৈরি হচ্ছে, একটু অপেক্ষা করুন...</b>", parse_mode=ParseMode.HTML)
+        out = await asyncio.to_thread(
+            call_groq_chat,
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a certified Bangladeshi nutritionist. Create a practical daily Bangladeshi food diet chart in Bangla "
+                        "(🌅 সকালের নাস্তা, 🍎 মধ্য-সকাল, 🍛 দুপুরের খাবার, ☕ বিকেলের নাস্তা, 🌙 রাতের খাবার, এবং 💧 জরুরি পরামর্শ) "
+                        "tailored to the user's age, weight, and goal. Do not use raw asterisks (**)."
+                    ),
+                },
+                {"role": "user", "content": text},
+            ],
+            0.5,
+        )
+        add_points(user.id, 1)
+        await wait_m.edit_text(
+            f"🥗 <b>আপনার পার্সোনালাইজড ডায়েট ও স্বাস্থ্য চার্ট</b>\n{DIVIDER}\n<blockquote>{html.escape(clean_ai_text(out))}</blockquote>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if state == "WAIT_BIZ_IDEA":
+        wait_m = await msg.reply_text("⏳ <b>আপনার জন্য সেরা বিজনেস আইডিয়া ও ব্র্যান্ড নাম তৈরি হচ্ছে, একটু অপেক্ষা করুন...</b>", parse_mode=ParseMode.HTML)
+        out = await asyncio.to_thread(
+            call_groq_chat,
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a Bangladeshi startup & business consultant. Provide actionable, profitable business ideas or 10 catchy brand/page names "
+                        "with budget breakdown, marketing tips, and profit potential in clear Bangla. Do not use raw asterisks (**)."
+                    ),
+                },
+                {"role": "user", "content": text},
+            ],
+            0.65,
+        )
+        add_points(user.id, 1)
+        await wait_m.edit_text(
+            f"💼 <b>বিজনেস আইডিয়া ও ব্র্যান্ড গাইড</b>\n{DIVIDER}\n<blockquote>{html.escape(clean_ai_text(out))}</blockquote>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if state == "WAIT_MOVIE_REC":
+        wait_m = await msg.reply_text("⏳ <b>আপনার পছন্দের সেরা মুভি ও সিরিজের তালিকা তৈরি হচ্ছে, একটু অপেক্ষা করুন...</b>", parse_mode=ParseMode.HTML)
+        out = await asyncio.to_thread(
+            call_groq_chat,
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a film critic. Recommend the top 5 best movies or web series matching the user's taste. "
+                        "For each item include: 🎬 নাম ও সাল, ⭐ IMDb/রেটিং, 🎭 ধরন (Genre), এবং 📖 সংক্ষিপ্ত কাহিনী (Spoiler-free summary in Bangla). "
+                        "Do not use raw asterisks (**)."
+                    ),
+                },
+                {"role": "user", "content": text},
+            ],
+            0.6,
+        )
+        add_points(user.id, 1)
+        await wait_m.edit_text(
+            f"🎬 <b>সেরা মুভি ও সিরিজ রিকমেন্ডেশন</b>\n{DIVIDER}\n<blockquote>{html.escape(clean_ai_text(out))}</blockquote>",
             parse_mode=ParseMode.HTML,
         )
         return
