@@ -449,8 +449,8 @@ def add_points(user_id: int, pts: int) -> None:
 
 def clean_ai_text(text: str) -> str:
     """
-    Removes ugly raw markdown (**bold**, ### headers, LaTeX math symbols) from AI output
-    so every message looks clean, readable, and professional inside Telegram HTML cards.
+    Removes ugly raw markdown (**bold**, ### headers, LaTeX math symbols, and Markdown tables)
+    from AI output so every message looks clean, readable, and natural inside Telegram cards.
     """
     if not text:
         return ""
@@ -459,7 +459,20 @@ def clean_ai_text(text: str) -> str:
     t = t.replace("\times", "×").replace("\div", "÷").replace("\pm", "±")
     t = t.replace("\therefore", "∴").replace("\Rightarrow", "⇒").replace("\approx", "≈")
     t = t.replace("$$", "").replace("$", "")
-    return t.strip()
+
+    # Strip Markdown table separator rows (e.g. |---|---|) and convert table rows into clean text lines
+    cleaned_lines = []
+    for line in t.splitlines():
+        s = line.strip()
+        if re.match(r"^[|\s:\-]+$", s) and "|" in s and "-" in s:
+            continue
+        if s.startswith("|") and s.endswith("|"):
+            cells = [c.strip() for c in s.strip("|").split("|") if c.strip()]
+            if cells:
+                cleaned_lines.append("• " + " — ".join(cells))
+            continue
+        cleaned_lines.append(line)
+    return "\n".join(cleaned_lines).strip()
 
 
 def get_total_users() -> int:
@@ -949,27 +962,59 @@ def enhance_image_prompt_with_groq(user_prompt: str) -> str:
     return f"{user_prompt}, masterpiece, ultra detailed, 8k photorealistic, cinematic lighting, sharp focus"
 
 
-def remove_bottom_watermark_and_polish(img_bytes: bytes) -> bytes:
+def _has_corner_watermark(im: Image.Image) -> bool:
     """
-    Guarantees 100% watermark-free, razor-sharp AI images.
+    Detects if an image has a synthetic white/bright watermark box or text badge
+    in the bottom-right, bottom-left, or bottom-center strip.
+    """
+    rgb = im.convert("RGB")
+    w, h = rgb.size
+    for x1_r, x2_r in ((0.55, 1.0), (0.0, 0.45), (0.25, 0.75)):
+        strip = rgb.crop((int(w * x1_r), int(h * 0.91), int(w * x2_r), h))
+        pixels = list(strip.getdata())
+        if not pixels:
+            continue
+        very_bright = sum(1 for r, g, b in pixels if r > 240 and g > 240 and b > 240)
+        very_dark = sum(1 for r, g, b in pixels if r < 20 and g < 20 and b < 20)
+        total = len(pixels)
+        if very_bright / total > 0.06 and very_dark / total > 0.06:
+            return True
+    return False
+
+
+def remove_bottom_watermark_and_polish(img_bytes: bytes, aggressive_crop: bool = False) -> bytes:
+    """
+    Guarantees 100% watermark-free, razor-sharp 1024x1024 AI images.
+    - Cuts bottom 16%, top 5%, and 7% on left/right whenever aggressive_crop is True or
+      a watermark signature is detected, then verifies the final image is 100% clean.
     """
     with Image.open(io.BytesIO(img_bytes)) as im:
         rgb = im.convert("RGB")
         w, h = rgb.size
-        if h >= 1060 and w == 1024:
-            final_im = rgb.crop((0, 0, 1024, 1024))
-        elif w == h and w >= 512:
-            crop_bottom = int(h * 0.94)
-            margin_x = int(w * 0.03)
-            cropped = rgb.crop((margin_x, 0, w - margin_x, crop_bottom))
+
+        if aggressive_crop or _has_corner_watermark(rgb) or h >= 1100:
+            # Slice off top 5%, bottom 16%, and 7% left/right so NO watermark at the bottom or corners can survive
+            crop_top = int(h * 0.05)
+            crop_bottom = int(h * 0.84)
+            margin_x = int(w * 0.07)
+            cropped = rgb.crop((margin_x, crop_top, w - margin_x, crop_bottom))
             resample_filter = getattr(Image, "Resampling", Image).LANCZOS
             final_im = cropped.resize((1024, 1024), resample_filter)
         else:
             resample_filter = getattr(Image, "Resampling", Image).LANCZOS
-            final_im = rgb.resize((1024, 1024), resample_filter)
+            final_im = rgb.resize((1024, 1024), resample_filter) if (w != 1024 or h != 1024) else rgb
 
-        final_im = ImageEnhance.Sharpness(final_im).enhance(1.18)
-        final_im = ImageEnhance.Contrast(final_im).enhance(1.05)
+        # If a watermark signature still somehow survived, do one extra inner trim
+        if _has_corner_watermark(final_im):
+            cw, ch = final_im.size
+            final_im = final_im.crop((int(cw * 0.05), int(ch * 0.03), int(cw * 0.95), int(ch * 0.88))).resize(
+                (1024, 1024), getattr(Image, "Resampling", Image).LANCZOS
+            )
+            if _has_corner_watermark(final_im):
+                raise ValueError("Watermark still detected on image; rejecting engine.")
+
+        final_im = ImageEnhance.Sharpness(final_im).enhance(1.16)
+        final_im = ImageEnhance.Contrast(final_im).enhance(1.04)
 
         out_bio = io.BytesIO()
         final_im.save(out_bio, format="JPEG", quality=98, subsampling=0, optimize=True)
@@ -977,7 +1022,7 @@ def remove_bottom_watermark_and_polish(img_bytes: bytes) -> bytes:
 
 
 def _is_valid_image_bytes(raw: bytes) -> bool:
-    if not raw or len(raw) < 2500:
+    if not raw or len(raw) < 3500:
         return False
     try:
         with Image.open(io.BytesIO(raw)) as im:
@@ -989,12 +1034,9 @@ def _is_valid_image_bytes(raw: bytes) -> bool:
 
 def generate_ai_image_multi_engine(raw_prompt: str, enhanced_prompt: str) -> bytes:
     """
-    Multi-Tool AI Image Generator (Tries 5 independent free AI image tools so it NEVER fails!):
-    1. Airforce Free Flux / Imagine API (api.airforce)
-    2. HuggingFace Gradio Public Space API (FLUX.1-schnell / SDXL-Lightning)
-    3. Pollinations Unified & Direct Endpoints (pollinations.ai/p/ & image.pollinations.ai)
-    4. Hercai v3 Free Text2Image API
-    5. Lexica Art High-Res AI Search Engine Fallback
+    100% Watermark-Free Multi-Engine AI Image Generator:
+    Tries 6 independent free AI image engines in order. If any engine fails or has a watermark,
+    it automatically moves to the next engine and NEVER sends a watermarked image.
     """
     headers = {
         "User-Agent": (
@@ -1007,98 +1049,117 @@ def generate_ai_image_multi_engine(raw_prompt: str, enhanced_prompt: str) -> byt
     enc_enh = urllib.parse.quote(enhanced_prompt)
     enc_raw = urllib.parse.quote(raw_prompt)
 
-    # Tool 1: Pollinations Fast Endpoints (Flux, Turbo, Default) with short 22s timeout
-    pollinations_urls = [
-        f"https://pollinations.ai/p/{enc_enh}?width=1024&height=1100&seed={rand_seed}&nologo=true&model=flux",
-        f"https://image.pollinations.ai/prompt/{enc_enh}?width=1024&height=1100&seed={rand_seed}&nologo=true&model=flux",
-        f"https://image.pollinations.ai/prompt/{enc_enh}?width=1024&height=1024&seed={rand_seed}&nologo=true&model=turbo",
-        f"https://image.pollinations.ai/prompt/{enc_raw}?width=1024&height=1024&nologo=true&seed=42",
+    # Engine 1: HuggingFace Official Gradio Spaces (100% Native Watermark-Free Raw Model Output)
+    hf_spaces = [
+        ("https://black-forest-labs-flux-1-schnell.hf.space", "/call/infer", [enhanced_prompt, rand_seed, False, 1024, 1024, 4]),
+        ("https://multimodalart-flux-1-merged.hf.space", "/call/infer", [enhanced_prompt, rand_seed, False, 1024, 1024, 4]),
+        ("https://bytedance-sdxl-lightning.hf.space", "/call/generate_image", [enhanced_prompt, "4-Step"]),
     ]
-    for p_url in pollinations_urls:
+    for space_url, endpoint, payload_data in hf_spaces:
         try:
-            r = requests.get(p_url, headers=headers, timeout=22)
-            if r.status_code == 200 and _is_valid_image_bytes(r.content):
-                return remove_bottom_watermark_and_polish(r.content)
+            post_r = requests.post(
+                f"{space_url}{endpoint}",
+                json={"data": payload_data},
+                headers={"Content-Type": "application/json", "User-Agent": headers["User-Agent"]},
+                timeout=14,
+            )
+            if post_r.status_code == 200 and "event_id" in post_r.json():
+                ev_id = post_r.json()["event_id"]
+                sse_r = requests.get(f"{space_url}{endpoint}/{ev_id}", headers=headers, timeout=22)
+                if sse_r.status_code == 200:
+                    m_url = re.search(r'"url":\s*"(https?://[^"]+)"', sse_r.text)
+                    if m_url:
+                        img_r = requests.get(m_url.group(1), headers=headers, timeout=18)
+                        if img_r.status_code == 200 and _is_valid_image_bytes(img_r.content):
+                            return remove_bottom_watermark_and_polish(img_r.content, aggressive_crop=False)
         except Exception as e:
-            logger.warning(f"Pollinations URL skipped ({p_url[:60]}...): {e}")
+            logger.debug(f"HF Space {space_url} skipped: {e}")
 
-    # Tool 2: Airforce Free Imagine API (Flux / Flux-Realism)
+    # Engine 2: Subnp Free AI Image Generator API (Flux / Turbo)
+    for sub_model in ("flux", "turbo"):
+        try:
+            sub_r = requests.post(
+                "https://subnp.com/api/free/generate",
+                json={"prompt": enhanced_prompt, "model": sub_model},
+                headers={"Content-Type": "application/json", "User-Agent": headers["User-Agent"]},
+                timeout=20,
+            )
+            if sub_r.status_code == 200:
+                m_img = re.search(r'"imageUrl":\s*"(https?://[^"]+)"', sub_r.text)
+                if m_img:
+                    img_r = requests.get(m_img.group(1), headers=headers, timeout=18)
+                    if img_r.status_code == 200 and _is_valid_image_bytes(img_r.content):
+                        return remove_bottom_watermark_and_polish(img_r.content, aggressive_crop=True)
+        except Exception as e:
+            logger.debug(f"Subnp {sub_model} skipped: {e}")
+
+    # Engine 3: Hercai v3 Free AI Image Generator API
+    try:
+        hc_url = f"https://hercai.onrender.com/v3/text2image?prompt={enc_enh}"
+        hc_r = requests.get(hc_url, headers=headers, timeout=20)
+        if hc_r.status_code == 200 and hc_r.json().get("url"):
+            img_r = requests.get(hc_r.json()["url"], headers=headers, timeout=18)
+            if img_r.status_code == 200 and _is_valid_image_bytes(img_r.content):
+                return remove_bottom_watermark_and_polish(img_r.content, aggressive_crop=False)
+    except Exception as e:
+        logger.debug(f"Hercai skipped: {e}")
+
+    # Engine 4: Lexica Art High-Res AI Render Search (100% Native Watermark-Free AI Art)
+    for q_str in (enc_enh, enc_raw):
+        try:
+            lex_url = f"https://lexica.art/api/v1/search?q={q_str}"
+            lex_r = requests.get(lex_url, headers=headers, timeout=15)
+            if lex_r.status_code == 200:
+                imgs = lex_r.json().get("images", [])
+                for chosen in imgs[:4]:
+                    src_url = chosen.get("src")
+                    if src_url:
+                        img_r = requests.get(src_url, headers=headers, timeout=15)
+                        if img_r.status_code == 200 and _is_valid_image_bytes(img_r.content):
+                            return remove_bottom_watermark_and_polish(img_r.content, aggressive_crop=False)
+        except Exception as e:
+            logger.debug(f"Lexica skipped: {e}")
+
+    # Engine 5: Airforce Free Flux API (with mandatory deep crop + watermark rejection check)
     for af_model in ("flux", "flux-realism", "sdxl"):
         try:
             af_url = (
                 f"https://api.airforce/v1/imagine2?prompt={enc_enh}"
                 f"&model={af_model}&size=1:1&seed={rand_seed}"
             )
-            r = requests.get(af_url, headers=headers, timeout=25)
+            r = requests.get(af_url, headers=headers, timeout=20)
             if r.status_code == 200 and _is_valid_image_bytes(r.content):
-                return remove_bottom_watermark_and_polish(r.content)
+                return remove_bottom_watermark_and_polish(r.content, aggressive_crop=True)
         except Exception as e:
-            logger.warning(f"Airforce {af_model} skipped: {e}")
+            logger.debug(f"Airforce {af_model} skipped: {e}")
 
-    # Tool 3: HuggingFace Public Gradio Space (FLUX.1-schnell)
-    hf_spaces = [
-        "https://black-forest-labs-flux-1-schnell.hf.space",
-        "https://multimodalart-flux-1-merged.hf.space",
+    # Engine 6: Pollinations 1024x1280 Tall Mode with mandatory 16% bottom + 7% side crop & watermark rejection check
+    pollinations_urls = [
+        f"https://pollinations.ai/p/{enc_enh}?width=1024&height=1280&seed={rand_seed}&nologo=true&model=flux",
+        f"https://image.pollinations.ai/prompt/{enc_enh}?width=1024&height=1280&seed={rand_seed}&nologo=true&model=flux",
+        f"https://image.pollinations.ai/prompt/{enc_raw}?width=1024&height=1280&nologo=true&seed=42",
     ]
-    for space_url in hf_spaces:
+    for p_url in pollinations_urls:
         try:
-            post_r = requests.post(
-                f"{space_url}/call/infer",
-                json={"data": [enhanced_prompt, rand_seed, False, 1024, 1024, 4]},
-                headers={"Content-Type": "application/json", "User-Agent": headers["User-Agent"]},
-                timeout=15,
-            )
-            if post_r.status_code == 200 and "event_id" in post_r.json():
-                ev_id = post_r.json()["event_id"]
-                sse_r = requests.get(f"{space_url}/call/infer/{ev_id}", headers=headers, timeout=25)
-                if sse_r.status_code == 200:
-                    m_url = re.search(r'"url":\s*"(https?://[^"]+)"', sse_r.text)
-                    if m_url:
-                        img_r = requests.get(m_url.group(1), headers=headers, timeout=20)
-                        if img_r.status_code == 200 and _is_valid_image_bytes(img_r.content):
-                            return remove_bottom_watermark_and_polish(img_r.content)
+            r = requests.get(p_url, headers=headers, timeout=22)
+            if r.status_code == 200 and _is_valid_image_bytes(r.content):
+                return remove_bottom_watermark_and_polish(r.content, aggressive_crop=True)
         except Exception as e:
-            logger.warning(f"HF Space {space_url} skipped: {e}")
+            logger.debug(f"Pollinations URL skipped: {e}")
 
-    # Tool 4: Hercai v3 Free AI Image Generator API
-    try:
-        hc_url = f"https://hercai.onrender.com/v3/text2image?prompt={enc_enh}"
-        hc_r = requests.get(hc_url, headers=headers, timeout=25)
-        if hc_r.status_code == 200 and hc_r.json().get("url"):
-            img_r = requests.get(hc_r.json()["url"], headers=headers, timeout=20)
-            if img_r.status_code == 200 and _is_valid_image_bytes(img_r.content):
-                return remove_bottom_watermark_and_polish(img_r.content)
-    except Exception as e:
-        logger.warning(f"Hercai fallback skipped: {e}")
-
-    # Tool 5: Lexica Art AI Generated Image Search API (returns real AI-generated artwork matching the prompt)
-    try:
-        lex_url = f"https://lexica.art/api/v1/search?q={enc_enh}"
-        lex_r = requests.get(lex_url, headers=headers, timeout=15)
-        if lex_r.status_code == 200:
-            imgs = lex_r.json().get("images", [])
-            for item in imgs[:3]:
-                src_url = item.get("src")
-                if src_url:
-                    img_r = requests.get(src_url, headers=headers, timeout=15)
-                    if img_r.status_code == 200 and _is_valid_image_bytes(img_r.content):
-                        return remove_bottom_watermark_and_polish(img_r.content)
-    except Exception as e:
-        logger.warning(f"Lexica fallback skipped: {e}")
-
-    raise RuntimeError("All 5 AI image generation engines failed.")
+    raise RuntimeError("All AI image generation engines failed.")
 
 
 # ---------------------------------------------------------------------------
-# PREMIUM BRANDED STUDIO QR CODE GENERATOR
+# PREMIUM BRANDED STUDIO QR CODE GENERATOR (CENTERED "SCAN ME" FOOTER ONLY)
 # ---------------------------------------------------------------------------
 def generate_premium_qr_card(data_text: str) -> io.BytesIO:
     """
-    Creates a 1000x1180 Royal Studio Branded QR Poster Card with:
+    Creates a 1000x1160 Royal Studio Branded QR Poster Card with:
     - Deep Royal Navy background (#0B1120) & glowing cyan/gold frame
     - Rounded white QR container with soft drop shadow
     - High-density ERROR_CORRECT_H navy QR code with a central Royal Gold/Cyan badge
-    - Clean header and footer labels
+    - Centered "SCAN ME" ONLY in the bottom footer (never prints raw link/text in footer!)
     """
     qr = qrcode.QRCode(
         version=None,
@@ -1111,7 +1172,6 @@ def generate_premium_qr_card(data_text: str) -> io.BytesIO:
     qr_img = qr.make_image(fill_color="#0F172A", back_color="white").convert("RGBA")
     qr_img = qr_img.resize((680, 680), getattr(Image, "Resampling", Image).LANCZOS)
 
-    # Draw a sleek center emblem inside the QR code (ERROR_CORRECT_H allows up to 30% center coverage safely!)
     draw_qr = ImageDraw.Draw(qr_img)
     cx, cy = 340, 340
     r_outer = 64
@@ -1131,11 +1191,17 @@ def generate_premium_qr_card(data_text: str) -> io.BytesIO:
     )
     try:
         font_badge = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 38)
+        font_title = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 32)
+        font_scan = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 36)
     except Exception:
         font_badge = ImageFont.load_default()
-    draw_qr.text((cx - 30, cy - 22), "QR", fill="#F59E0B", font=font_badge)
+        font_title = ImageFont.load_default()
+        font_scan = ImageFont.load_default()
 
-    # Create full 1000x1160 poster canvas
+    b_bbox = draw_qr.textbbox((0, 0), "QR", font=font_badge)
+    bw_txt, bh_txt = b_bbox[2] - b_bbox[0], b_bbox[3] - b_bbox[1]
+    draw_qr.text((cx - bw_txt // 2, cy - bh_txt // 2 - 4), "QR", fill="#F59E0B", font=font_badge)
+
     canvas_w, canvas_h = 1000, 1160
     canvas = Image.new("RGB", (canvas_w, canvas_h), "#0B1120")
     draw = ImageDraw.Draw(canvas)
@@ -1144,51 +1210,39 @@ def generate_premium_qr_card(data_text: str) -> io.BytesIO:
     draw.rounded_rectangle((28, 28, canvas_w - 28, canvas_h - 28), radius=38, outline="#0EA5E9", width=4)
     draw.rounded_rectangle((40, 40, canvas_w - 40, canvas_h - 40), radius=32, outline="#F59E0B", width=2)
 
-    # Top header pill
+    # Top header pill (centered text)
     draw.rounded_rectangle((180, 75, canvas_w - 180, 155), radius=40, fill="#1E293B", outline="#38BDF8", width=2)
-    try:
-        font_title = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 32)
-        font_sub = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 22)
-    except Exception:
-        font_title = ImageFont.load_default()
-        font_sub = ImageFont.load_default()
-
-    draw.text((255, 97), "PREMIUM SMART QR CODE", fill="#F8FAFC", font=font_title)
+    header_text = "PREMIUM SMART QR CODE"
+    h_bbox = draw.textbbox((0, 0), header_text, font=font_title)
+    hw_txt, hh_txt = h_bbox[2] - h_bbox[0], h_bbox[3] - h_bbox[1]
+    draw.text(((canvas_w - hw_txt) // 2, 115 - hh_txt // 2 - 3), header_text, fill="#F8FAFC", font=font_title)
 
     # White rounded card behind QR
     card_x1, card_y1, card_x2, card_y2 = 120, 195, 880, 955
-    # Subtle glow shadow
     draw.rounded_rectangle((card_x1 - 6, card_y1 - 6, card_x2 + 6, card_y2 + 6), radius=42, fill="#0284C7")
     draw.rounded_rectangle((card_x1, card_y1, card_x2, card_y2), radius=38, fill="#FFFFFF")
 
-    # Paste QR onto white card
     canvas.paste(qr_img.convert("RGB"), (160, 235))
 
     # Corner scanner brackets inside white card
     b_col = "#0EA5E9"
     bw = 6
     bl = 45
-    # Top-left
     draw.line([(145, 220), (145 + bl, 220)], fill=b_col, width=bw)
     draw.line([(145, 220), (145, 220 + bl)], fill=b_col, width=bw)
-    # Top-right
     draw.line([(855 - bl, 220), (855, 220)], fill=b_col, width=bw)
     draw.line([(855, 220), (855, 220 + bl)], fill=b_col, width=bw)
-    # Bottom-left
     draw.line([(145, 930 - bl), (145, 930)], fill=b_col, width=bw)
     draw.line([(145, 930), (145 + bl, 930)], fill=b_col, width=bw)
-    # Bottom-right
     draw.line([(855 - bl, 930), (855, 930)], fill=b_col, width=bw)
     draw.line([(855, 930 - bl), (855, 930)], fill=b_col, width=bw)
 
-    # Bottom footer bar
-    draw.rounded_rectangle((120, 995, 880, 1085), radius=26, fill="#1E293B", outline="#F59E0B", width=2)
-    preview_ascii = "".join(ch if ord(ch) < 128 else "" for ch in data_text).strip()
-    if not preview_ascii:
-        preview_ascii = "SCAN WITH ANY CAMERA OR QR READER"
-    elif len(preview_ascii) > 42:
-        preview_ascii = preview_ascii[:39] + "..."
-    draw.text((230, 1025), f"SCAN ME  •  {preview_ascii}", fill="#38BDF8", font=font_sub)
+    # Bottom footer bar: ONLY "SCAN ME" centered in the middle!
+    draw.rounded_rectangle((220, 995, canvas_w - 220, 1085), radius=45, fill="#1E293B", outline="#F59E0B", width=3)
+    footer_text = "SCAN ME"
+    f_bbox = draw.textbbox((0, 0), footer_text, font=font_scan)
+    fw_txt, fh_txt = f_bbox[2] - f_bbox[0], f_bbox[3] - f_bbox[1]
+    draw.text(((canvas_w - fw_txt) // 2, 1040 - fh_txt // 2 - 4), footer_text, fill="#F59E0B", font=font_scan)
 
     out_bio = io.BytesIO()
     canvas.save(out_bio, format="PNG", optimize=True)
@@ -1403,7 +1457,7 @@ ABOUT_TEXT = (
     "২. <b>🎙️ Voice বানান</b> — যেকোনো লেখা থেকে বাংলা (নারী/পুরুষ) ও ইংরেজি ভয়েস তৈরি\n"
     "৩. <b>🎤 Voice → Text</b> — ভয়েস মেসেজ থেকে অটোমেটিক বাংলা/ইংরেজি টেক্সট রূপান্তর\n"
     "৪. <b>🖼️ AI ছবি</b> — ১০০% লোগো ও ওয়াটারমার্ক-মুক্ত HD ছবি তৈরি\n"
-    "৫. <b>📥 ভিডিও ডাউনলোড</b> — TikTok, YouTube, Facebook, Instagram ভিডিও ডাউনলোড\n"
+    "৫. <b>📥 ভিডিও ডাউনলোড</b> — TikTok ও Instagram ভিডিও দ্রুত ডাউনলোড\n"
     "৬. <b>🌐 অনুবাদ</b> — বাংলা ↔ English নিখুঁত অনুবাদ\n"
     "৭. <b>✍️ Caption বানান</b> — ইমোজি ও হ্যাশট্যাগসহ ৫টি ভাইরাল বাংলা ক্যাপশন\n"
     "৮. <b>📖 গল্প / কবিতা</b> — যেকোনো টপিকে বাংলা গল্প বা কবিতা রচনা"
@@ -1849,32 +1903,38 @@ def convert_unit_input(raw_text: str) -> str:
 
 
 def generate_fancy_text(text: str) -> str:
+    """
+    Generates 100% easily readable, clean, modern stylish text variations (no weird unreadable symbols!).
+    Also includes stylish frames that work for both Bangla and English names/texts.
+    """
     normal = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-    styles = {
-        "𝐁𝐨𝐥𝐝": "𝐚𝐛𝐜𝐝𝐞𝐟𝐠𝐡𝐢𝐣𝐤𝐥𝐦𝐧𝐨𝐩𝐪𝐫𝐬𝐭𝐮𝐯𝐰𝐱𝐲𝐳𝐀𝐁𝐂𝐃𝐄𝐅𝐆𝐇𝐈𝐉𝐊𝐋𝐌𝐍𝐎𝐏𝐐𝐑𝐒𝐓𝐔𝐕𝐖𝐗𝐘𝐙𝟎𝟏𝟐𝟑𝟒𝟓𝟔𝟕𝟖𝟗",
-        "𝐼𝑡𝑎𝑙𝑖𝑐": "𝑖𝑏𝑐𝑑𝑒𝑓𝑔ℎ𝑖𝑗𝑘𝑙𝑚𝑛𝑜𝑝𝑞𝑟𝑠𝑡𝑢𝑣𝑤𝑥𝑦𝑧𝐴𝐵𝐶𝐷𝐸𝐹𝐺𝐻𝐼𝐽𝐾𝐿𝑀𝑁𝑂𝑃𝑄𝑅𝑆𝑇𝑈𝑉𝑊𝑋𝑌𝑍0123456789",
-        "𝑩𝒐𝒍𝒅 𝑰𝒕𝒂𝒍𝒊𝒄": "𝒂𝒃𝒄𝒅𝒆𝒇𝒈𝒉𝒊𝒋𝒌𝒍𝒎𝒏𝒐𝒑𝒒𝒓𝒔𝒕𝒖𝒗𝒘𝒙𝒚𝒛𝑨𝑩𝑪𝑫𝑬𝑭𝑮𝑯𝑰𝑱𝑲𝑳𝑴𝑵𝑶𝑷𝑸𝑹𝑺𝑻𝑼𝑽𝑾𝑿𝒀𝒁0123456789",
-        "𝒮𝒸𝓇𝒾𝓅𝓉": "𝒶𝒷𝒸𝒹ℯ𝒻ℊ𝒽𝒾𝒿𝓀𝓁𝓂𝓃ℴ𝓅𝓆𝓇𝓈𝓉𝓊𝓋𝓌𝓍𝓎𝓏𝒜ℬ𝒞𝒟ℰℱ𝒢ℋℐJKℒℳ𝒩𝒪𝒫𝒬ℛ𝒮𝒯𝒰𝒱𝒲𝒳𝒴𝒵0123456789",
-        "𝕭𝖔𝖑𝖉 𝕾𝖈𝖗𝖎𝖕𝖙": "𝖆𝖇𝖈𝖉𝖊𝖋𝖌𝖍𝖎𝖏𝖐𝖑𝖒𝖓𝖔𝖕𝖖𝖗𝖘𝖙𝖚𝖛𝖜𝖝𝖞𝖟𝕬𝕭𝕮𝕯𝕰𝕱𝕲𝕳𝕴𝕵𝕶𝕷𝕸𝕹𝕺𝕻𝕼𝕽𝕾𝕿𝖀𝖁𝖂𝖃𝖄𝖅0123456789",
-        "𝔻𝕠𝕦𝕓𝕝𝕖": "𝕒𝕓𝕔𝕕𝕖𝕗𝕘𝕙𝕚𝕛𝕜𝕝𝕞𝕟𝕠𝕡𝕢𝕣𝕤𝕥𝕦𝕧𝕨𝕩𝕪𝕫𝔸𝔹ℂ𝔻𝔼𝔽𝔾ℍ𝕀𝕁𝕂𝕃𝕄ℕ𝕆ℙℚℝ𝕊𝕋𝕌𝕍𝕎𝕏𝕐ℤ𝟘𝟙𝟚𝟛𝟜𝟝𝟞𝟟𝟠𝟡",
-        "𝙼𝚘𝚗𝚘𝚜𝚙𝚊𝚌𝚎": "𝚊𝚋𝚌𝚍𝚎𝚏𝚐𝚑𝚒𝚓𝚔𝚕𝚖𝚗𝚘𝚙𝚚𝚛𝚜𝚝𝚞𝚟𝚠𝚡𝚢𝚣𝙰𝙱𝙲𝙳𝙴𝙵𝙶𝙷𝙸𝙹𝙺𝙻𝙼𝙽𝙾𝙿𝚀𝚁𝚂𝚃𝚄𝚅𝚆𝚇𝚈𝚉𝟶𝟷𝟸𝟹𝟺𝟻𝟼𝟽𝟾𝟿",
-        "Ⓒⓘⓡⓒⓛⓔⓓ": "ⓐⓑⓒⓓⓔⓕⓖⓗⓘⓙⓚⓛⓜⓝⓞⓟⓠⓡⓢⓣⓤⓥⓦⓧⓨⓩⒶⒷⒸⒹⒺⒻⒼⒽⒾⒿⓀⓁⓂⓃⓄⓅⓆⓇⓈⓉⓊⓋⓌⓍⓎⓏ0①②③④⑤⑥⑦⑧⑨",
-    }
+    styles = [
+        ("Modern Bold", "𝗮𝗯𝗰𝗱𝗲𝗳𝗴𝗵𝗶𝗷𝗸𝗹𝗺𝗻𝗼𝗽𝗾𝗿𝘀𝘁𝘂𝘃𝘄𝘅𝘆𝘇𝗔𝗕𝗖𝗗𝗘𝗙𝗚𝗛𝗜𝗝𝗞𝗟𝗠𝗡𝗢𝗣𝗤𝗥𝗦𝗧𝗨𝗩𝗪𝗫𝗬𝗭𝟬𝟭𝟮𝟯𝟰𝟱𝟲𝟳𝟴𝟵"),
+        ("Classic Bold", "𝐚𝐛𝐜𝐝𝐞𝐟𝐠𝐡𝐢𝐣𝐤𝐥𝐦𝐧𝐨𝐩𝐪𝐫𝐬𝐭𝐮𝐯𝐰𝐱𝐲𝐳𝐀𝐁𝐂𝐃𝐄𝐅𝐆𝐇𝐈𝐉𝐊𝐋𝐌𝐍𝐎𝐏𝐐𝐑𝐒𝐓𝐔𝐕𝐖𝐗𝐘𝐙𝟎𝟏𝟐𝟑𝟒𝟓𝟔𝟕𝟖𝟗"),
+        ("Clean Italic", "𝘢𝘣𝘤𝘥𝘦𝘧𝘨𝘩𝘪𝘫𝘬𝘭𝘮𝘯𝘰𝘱𝘲𝘳𝘴𝘵𝘶𝘷𝘸𝘹𝘺𝘻𝘈𝘉𝘊𝘋𝘌𝘍𝘎𝘏𝘐𝘑𝘒𝘓𝘔𝘕𝘖𝘗𝘘𝘙𝘚𝘛𝘜𝘝𝘞𝘟𝘠𝘡0123456789"),
+        ("Bold Italic", "𝙖𝙗𝙘𝙙𝙚𝙛𝙜𝙝𝙞𝙟𝙠𝙡𝙢𝙣𝙤𝙥𝙦𝙧𝙨𝙩𝙪𝙫𝙬𝙭𝙮𝙯𝘼𝘽𝘾𝘿𝙀𝙁𝙂𝙃𝙄𝙅𝙆𝙇𝙈𝙉𝙊𝙋𝚀𝙍𝙎𝙏𝙐𝙑𝙒𝙓𝙔𝙕0123456789"),
+        ("Small Caps", "ᴀʙᴄᴅᴇꜰɢʜɪᴊᴋʟᴍɴᴏᴘǫʀꜱᴛᴜᴠᴡxʏᴢABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"),
+        ("Monospace", "𝚊𝚋𝚌𝚍𝚎𝚏𝚐𝚑𝚒𝚓𝚔𝚕𝚖𝚗𝚘𝚙𝚚𝚛𝚜𝚝𝚞𝚟𝚠𝚡𝚢𝚣𝙰𝙱𝙲𝙳𝙴𝙵𝙶𝙷𝙸𝙹𝙺𝙻𝙼𝙽𝙾𝙿𝚀𝚁𝚂𝚃𝚄𝚅𝚆𝚇𝚈𝚉𝟶𝟷𝟸𝟹𝟺𝟻𝟼𝟽𝟾𝟿"),
+    ]
 
-    out = [f"✨ <b>আপনার স্টাইলিশ ফ্যান্সি টেক্সট</b>\n{DIVIDER}"]
+    out = [f"✨ <b>আপনার স্টাইলিশ লেখা (সহজে পড়া যায় এমন ফন্ট)</b>\n{DIVIDER}"]
     lines = []
-    for label, target in styles.items():
+    for idx, (label, target) in enumerate(styles, 1):
         if len(target) == len(normal):
             table = str.maketrans(normal, target)
             converted = text.translate(table)
         else:
             converted = text
-        lines.append(f"◈ {label}: <code>{html.escape(converted)}</code>")
+        lines.append(f"{en_to_bn_digits(str(idx))}. <code>{html.escape(converted)}</code>")
 
-    spaced = " ".join(list(text))
-    lines.append(f"◈ S p a c e d: <code>{html.escape(spaced)}</code>")
-    out.append("<blockquote>" + "\n".join(lines) + "</blockquote>")
-    out.append("👆 <i>যেকোনো স্টাইলের ওপর ট্যাপ করলেই কপি হয়ে যাবে!</i>")
+    # Readable aesthetic frames (work great for both Bangla & English!)
+    lines.append(f"৭. <code>★彡 {html.escape(text)} 彡★</code>")
+    lines.append(f"৮. <code>༺👑 {html.escape(text)} 👑༻</code>")
+    lines.append(f"৯. <code>❖ ─ {html.escape(text)} ─ ❖</code>")
+    lines.append(f"১০. <code>❝ {html.escape(text)} ❞</code>")
+
+    out.append("<blockquote>" + "\n\n".join(lines) + "</blockquote>")
+    out.append("👆 <i>যেকোনো লেখার ওপর ট্যাপ করলেই সাথে সাথে কপি হয়ে যাবে!</i>")
     return "\n".join(out)
 
 
@@ -2382,6 +2442,94 @@ def download_video_from_url(url: str) -> Tuple[str, str]:
                 raise
         except Exception as e:
             logger.warning(f"tikwm API failed: {e}")
+
+    # Stage 2B: Direct Facebook Raw HTML Video Extractor (extracts browser_native_hd_url / playable_url / og:video directly!)
+    if any(k in lower_u for k in ("facebook.com", "fb.watch", "fb.com")):
+        for fb_target in (resolved_url, url, resolved_url.replace("www.facebook.com", "m.facebook.com")):
+            try:
+                fb_headers = {
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Sec-Fetch-Mode": "navigate",
+                }
+                fb_r = requests.get(fb_target, headers=fb_headers, timeout=15)
+                if fb_r.status_code == 200 and fb_r.text:
+                    html_txt = fb_r.text
+                    for pat in (
+                        r'"browser_native_hd_url":"([^"]+)"',
+                        r'"playable_url_quality_hd":"([^"]+)"',
+                        r'"hd_src_no_ratelimit":"([^"]+)"',
+                        r'"hd_src":"([^"]+)"',
+                        r'"browser_native_sd_url":"([^"]+)"',
+                        r'"playable_url":"([^"]+)"',
+                        r'"sd_src_no_ratelimit":"([^"]+)"',
+                        r'"sd_src":"([^"]+)"',
+                        r'<meta\s+property="og:video"\s+content="([^"]+)"',
+                        r'<meta\s+property="og:video:secure_url"\s+content="([^"]+)"',
+                    ):
+                        m_fb = re.search(pat, html_txt)
+                        if m_fb:
+                            raw_v_url = m_fb.group(1).encode("utf-8").decode("unicode_escape").replace("\\/", "/")
+                            raw_v_url = html.unescape(raw_v_url)
+                            if raw_v_url.startswith("http"):
+                                out_path = os.path.join(tmp_dir, "fb_direct.mp4")
+                                if _stream_download_file(raw_v_url, out_path):
+                                    return out_path, "Facebook Video"
+            except ValueError as ve:
+                if str(ve) == "FILE_TOO_LARGE":
+                    raise
+            except Exception as e:
+                logger.debug(f"Direct FB HTML extractor skipped: {e}")
+
+    # Stage 2C: Direct YouTube Piped / Invidious Stream Extractor (bypasses Render IP block on YouTube!)
+    if any(k in lower_u for k in ("youtube.com", "youtu.be")):
+        yt_id_match = re.search(r"(?:v=|youtu\.be/|/shorts/|/embed/)([A-Za-z0-9_-]{11})", resolved_url + " " + url)
+        if yt_id_match:
+            vid_id = yt_id_match.group(1)
+            piped_apis = [
+                f"https://pipedapi.kavin.rocks/streams/{vid_id}",
+                f"https://pipedapi.tokhmi.xyz/streams/{vid_id}",
+                f"https://pipedapi.moomoo.me/streams/{vid_id}",
+            ]
+            for p_api in piped_apis:
+                try:
+                    pr = requests.get(p_api, headers={"User-Agent": ua}, timeout=12)
+                    if pr.status_code == 200:
+                        pdata = pr.json()
+                        v_streams = pdata.get("videoStreams") or []
+                        for vs in v_streams:
+                            if not vs.get("videoOnly", True) and vs.get("url"):
+                                out_path = os.path.join(tmp_dir, "yt_piped.mp4")
+                                if _stream_download_file(vs["url"], out_path):
+                                    return out_path, pdata.get("title") or "YouTube Video"
+                except ValueError as ve:
+                    if str(ve) == "FILE_TOO_LARGE":
+                        raise
+                except Exception:
+                    pass
+
+            invidious_apis = [
+                f"https://inv.tux.pizza/api/v1/videos/{vid_id}",
+                f"https://invidious.nerdvpn.de/api/v1/videos/{vid_id}",
+                f"https://invidious.jing.rocks/api/v1/videos/{vid_id}",
+            ]
+            for inv_api in invidious_apis:
+                try:
+                    ir = requests.get(inv_api, headers={"User-Agent": ua}, timeout=12)
+                    if ir.status_code == 200:
+                        idata = ir.json()
+                        f_streams = idata.get("formatStreams") or []
+                        for fs in f_streams:
+                            if fs.get("url"):
+                                out_path = os.path.join(tmp_dir, "yt_inv.mp4")
+                                if _stream_download_file(fs["url"], out_path):
+                                    return out_path, idata.get("title") or "YouTube Video"
+                except ValueError as ve:
+                    if str(ve) == "FILE_TOO_LARGE":
+                        raise
+                except Exception:
+                    pass
 
     # Stage 3: Dedicated External Downloader APIs for Facebook, Instagram & YouTube
     external_apis: List[str] = []
@@ -3754,7 +3902,7 @@ async def route_menu_button(
             await msg.reply_text(
                 f"📥 <b>অল-ইন-ওয়ান ভিডিও ডাউনলোডার</b>\n"
                 f"{DIVIDER}\n"
-                "<blockquote>🎬 <b>TikTok, YouTube, Facebook বা Instagram</b>-এর যেকোনো পাবলিক ভিডিওর লিংক (অথবা শেয়ার টেক্সট) পাঠান:</blockquote>",
+                "<blockquote>🎬 <b>TikTok অথবা Instagram</b>-এর যেকোনো পাবলিক ভিডিও বা Reels-এর লিংক পাঠান:</blockquote>",
                 parse_mode=ParseMode.HTML,
             )
 
@@ -4701,7 +4849,7 @@ async def process_state_text(text: str, msg, user, context: ContextTypes.DEFAULT
             logger.error(f"Video download failed: {e}", exc_info=True)
             await status_msg.edit_text(
                 "⚠️ <b>ভিডিওটি ডাউনলোড করা যায়নি।</b>\n"
-                "<blockquote>অনুগ্রহ করে নিশ্চিত করুন ভিডিওটি পাবলিক (Public) আছে এবং প্রাইভেট বা লগইন-লক করা নয় 🙏</blockquote>",
+                "<blockquote>অনুগ্রহ করে পাবলিক <b>TikTok অথবা Instagram</b> ভিডিও লিংক পাঠান এবং নিশ্চিত করুন ভিডিওটি প্রাইভেট নয় 🙏</blockquote>",
                 parse_mode=ParseMode.HTML,
             )
         finally:
@@ -4754,36 +4902,39 @@ async def process_state_text(text: str, msg, user, context: ContextTypes.DEFAULT
         return
 
     if state == "WAIT_CAPTION":
-        wait_m = await msg.reply_text("⏳ <b>আপনার জন্য ৫টি ভাইরাল ক্যাপশন ও English Hashtags তৈরি হচ্ছে, একটু অপেক্ষা করুন...</b>", parse_mode=ParseMode.HTML)
+        wait_m = await msg.reply_text("⏳ <b>আপনার জন্য ৫টি সুন্দর বাংলা ক্যাপশন তৈরি হচ্ছে, একটু অপেক্ষা করুন...</b>", parse_mode=ParseMode.HTML)
         out = await asyncio.to_thread(
             call_groq_chat,
             [
                 {
                     "role": "system",
                     "content": (
-                        "You are an elite Bangladeshi social media content creator. "
-                        "Generate 5 viral, heart-touching, aesthetic Bangla captions for Facebook, Instagram, and TikTok on the user's topic:\n"
-                        "১. ✨ Aesthetic / Poetic Bangla Caption\n"
-                        "২. 😎 Attitude / Royal Vibe Bangla Caption\n"
-                        "৩. ❤️ Emotional / Heart-Touching Bangla Caption\n"
-                        "৪. 📸 Short One-Liner Bangla Caption\n"
-                        "৫. 🌐 Stylish Banglish / English Mix Caption\n\n"
-                        "CRITICAL RULES:\n"
-                        "- After EVERY caption, include 5-6 trending ENGLISH hashtags ONLY (e.g., #AestheticVibes #BanglaCaption #Trending #ViralPost #Mood #Photography). NEVER write Bangla hashtags!\n"
-                        "- Do NOT use raw markdown asterisks (**)."
+                        "তুমি একজন সাধারণ মানুষের মনের ভাষা বোঝা সোশ্যাল মিডিয়া রাইটার। "
+                        "ইউজারের দেওয়া বিষয়ের ওপর ফেসবুক ও ইনস্টাগ্রামে নিজের ছবির সাথে দেওয়ার মতো একদম সহজ, স্বাভাবিক ও আবেগী ভাষায় ৫টি ছোট বাংলা ক্যাপশন (প্রতিটি ১ থেকে ২ লাইন) লিখে দাও।\n\n"
+                        "কঠোর নিয়মাবলী (অবশ্যই মানতে হবে):\n"
+                        "১. কোনো কঠিন বা সাহিত্যিক কবিতার ভাষা ব্যবহার করবে না—সাধারণ মানুষ প্রতিদিন যেভাবে মনের অনুভূতি প্রকাশ করে, ঠিক তেমন সহজ ও সুন্দর বাংলায় লিখবে।\n"
+                        "২. ক্যাপশনের উপরে বা পাশে 'Aesthetic', 'Attitude', 'Emotional', 'Short One-Liner', 'Stylish Banglish'—এই ধরনের কোনো ইংরেজি বা বাংলা লেবেল/হেডিং একদমই লিখবে না! শুধু ১., ২., ৩., ৪., ৫. নম্বর দিয়ে সরাসরি ক্যাপশন লিখবে।\n"
+                        "৩. প্রতিটি ক্যাপশনের পরের লাইনে ৪–৫টি ট্রেন্ডিং ইন্‌গলিশ হ্যাশট্যাগ (যেমন: #Mood #LifeVibes #Memories #Smile #Blessed) দেবে। কখনো বাংলা হ্যাশট্যাগ দেবে না।\n"
+                        "৪. কোনো ডাবল স্টার (**) বা মার্কডাউন চিহ্ন দেবে না।"
                     ),
                 },
-                {"role": "user", "content": f"টপিক: {text}"},
+                {"role": "user", "content": f"বিষয়: {text}"},
             ],
-            0.75,
-            1200,
+            0.7,
+            1000,
         )
         add_points(user.id, 1)
         cleaned_out = clean_ai_text(out)
+        # Strip any accidental category label prefixes if the LLM still tried to add them
+        cleaned_out = re.sub(
+            r"(?im)^([১-৫1-5][.)]\s*)(?:aesthetic|attitude|emotional|romantic|short|stylish|poetic|one-liner|banglish|ক্যাপশন)[^:\n]*:\s*",
+            r"\1",
+            cleaned_out,
+        )
         await wait_m.edit_text(
-            f"✍️ <b>ভাইরাল সোশ্যাল মিডিয়া ক্যাপশন ও English Hashtags</b>\n"
+            f"✍️ <b>আপনার ছবির জন্য ৫টি সুন্দর বাংলা ক্যাপশন</b>\n"
             f"{DIVIDER}\n"
-            f"📌 <b>টপিক:</b> {html.escape(text)}\n\n"
+            f"📌 <b>বিষয়:</b> {html.escape(text)}\n\n"
             f"<blockquote>{html.escape(cleaned_out)}</blockquote>",
             parse_mode=ParseMode.HTML,
         )
@@ -5064,16 +5215,17 @@ async def process_state_text(text: str, msg, user, context: ContextTypes.DEFAULT
         return
 
     if state == "WAIT_CODE_HELP":
-        wait_m = await msg.reply_text("⏳ <b>আপনার কোড তৈরি ও ডিবাগ করা হচ্ছে, অনুগ্রহ করে কিছুক্ষণ অপেক্ষা করুন...</b>", parse_mode=ParseMode.HTML)
+        wait_m = await msg.reply_text("⏳ <b>আপনার কোড তৈরি করা হচ্ছে, অনুগ্রহ করে কিছুক্ষণ অপেক্ষা করুন...</b>", parse_mode=ParseMode.HTML)
         out = await asyncio.to_thread(
             call_groq_chat,
             [
                 {
                     "role": "system",
                     "content": (
-                        "You are a senior Principal Software Engineer. Write 100% bug-free, production-ready code for the user's request. "
-                        "Put the code inside a single ```code``` block, and after the code block write a clear, easy-to-understand explanation in Bangla "
-                        "(কীভাবে কাজ করে এবং কীভাবে রান করবেন). Do not use raw asterisks (**)."
+                        "তুমি একজন দক্ষ প্রোগ্রামার ও সহজ ভাষার শিক্ষক। ইউজারের চাহিদা অনুযায়ী ১০০% নির্ভুল কোড একটি ```code``` ব্লকের ভেতরে লিখবে। "
+                        "আর কোড ব্লকের নিচে একদম সহজ, স্বাভাবিক বাংলায় (যেমন সাধারণ মানুষ কথা বলে) বুঝিয়ে দেবে: "
+                        "১) এই কোডটি কীভাবে কাজ করে, এবং ২) কোডটি কীভাবে রান বা ব্যবহার করতে হবে। "
+                        "ব্যাখ্যার ভেতরে কঠিন ইংরেজি বাক্য বা জটিল ভাষা ব্যবহার করবে না এবং কোনো ** চিহ্ন দেবে না।"
                     ),
                 },
                 {"role": "user", "content": text},
@@ -5094,7 +5246,7 @@ async def process_state_text(text: str, msg, user, context: ContextTypes.DEFAULT
                 f"<pre><code>{html.escape(extracted_code[:2800])}</code></pre>"
             )
             if explanation_part:
-                formatted_msg += f"\n\n💡 <b>বাংলায় ব্যাখ্যা ও ব্যবহারবিধি:</b>\n<blockquote>{html.escape(explanation_part[:1000])}</blockquote>"
+                formatted_msg += f"\n\n💡 <b>সহজ বাংলায় ব্যাখ্যা:</b>\n<blockquote>{html.escape(explanation_part[:1100])}</blockquote>"
         else:
             formatted_msg = (
                 f"💻 <b>প্রফেশনাল কোড জেনারেটর ও সমাধান</b>\n"
@@ -5105,35 +5257,30 @@ async def process_state_text(text: str, msg, user, context: ContextTypes.DEFAULT
         return
 
     if state == "WAIT_BIO_GEN":
-        wait_m = await msg.reply_text("⏳ <b>আপনার জন্য ৬টি স্টাইলিশ VIP প্রোফাইল বায়ো তৈরি হচ্ছে, একটু অপেক্ষা করুন...</b>", parse_mode=ParseMode.HTML)
+        wait_m = await msg.reply_text("⏳ <b>আপনার জন্য সুন্দর প্রোফাইল বায়ো তৈরি হচ্ছে, একটু অপেক্ষা করুন...</b>", parse_mode=ParseMode.HTML)
         out = await asyncio.to_thread(
             call_groq_chat,
             [
                 {
                     "role": "system",
                     "content": (
-                        "You are a VIP social media branding expert. Generate 6 ultra-stylish, aesthetic profile bios for Facebook, Instagram, and Telegram "
-                        "based on the user's input. Include decorative symbols (★, 彡, ❖, ┃, ♛), emojis, and stylish formatting across these 6 categories:\n"
-                        "১. 👑 Royal & Attitude VIP Bio\n"
-                        "২. ✨ Aesthetic & Minimalist Bio\n"
-                        "৩. 💻 Professional / Student / Dreamer Bio\n"
-                        "৪. 🌙 Islamic / Peaceful Mind Bio\n"
-                        "৫. 🇧🇩 Stylish Bangla Bio\n"
-                        "৬. 🔥 Short Swag One-Line Bio\n\n"
-                        "Do NOT use raw markdown asterisks (**). Keep each bio compact (2-4 lines) and ready to copy-paste."
+                        "ইউজারের দেওয়া নাম বা তথ্যের ওপর ভিত্তি করে ফেসবুক, ইনস্টাগ্রাম ও টেলিগ্রাম প্রোফাইলের জন্য ৫টি সুন্দর, মার্জিত ও পরিষ্কার বায়ো (Bio) লিখে দাও (বাংলা এবং সহজ ইংরেজিতে)।\n"
+                        "কঠোর নিয়ম:\n"
+                        "- কোনো অদ্ভুত বা জটিল ফন্ট ব্যবহার করবে না যা পড়তে কষ্ট হয়। একদম পরিষ্কার ও স্বাভাবিক অক্ষরে সুন্দর ইমোজি দিয়ে সাজিয়ে লিখবে।\n"
+                        "- শুধু ১. থেকে ৫. নম্বর দিয়ে পরপর ৫টি বায়ো দেবে, কোনো ইংরেজি ক্যাটাগরি হেডিং বা ** চিহ্ন দেবে না।"
                     ),
                 },
                 {"role": "user", "content": text},
             ],
-            0.75,
-            1200,
+            0.7,
+            1000,
         )
         add_points(user.id, 1)
         await wait_m.edit_text(
-            f"🪪 <b>আপনার স্টাইলিশ VIP প্রোফাইল বায়ো কালেকশন</b>\n"
+            f"🪪 <b>আপনার প্রোফাইল বায়ো কালেকশন</b>\n"
             f"{DIVIDER}\n"
             f"<blockquote>{html.escape(clean_ai_text(out))}</blockquote>\n"
-            f"💡 <i>আপনার পছন্দের যেকোনো বায়ো কপি করে সরাসরি FB / Instagram / Telegram প্রোফাইলে ব্যবহার করুন!</i>",
+            f"💡 <i>আপনার পছন্দের যেকোনো বায়ো কপি করে প্রোফাইলে ব্যবহার করুন!</i>",
             parse_mode=ParseMode.HTML,
         )
         return
@@ -5201,7 +5348,7 @@ async def process_state_text(text: str, msg, user, context: ContextTypes.DEFAULT
             [
                 {
                     "role": "system",
-                    "content": "You are a helpful medical guide. Answer blood group, blood donation eligibility, hemoglobin, and health questions clearly in Bangla without raw asterisks (**).",
+                    "content": "You are a helpful medical guide. Answer blood group, blood donation eligibility, hemoglobin, and health questions clearly in simple Bangla list format without tables or raw asterisks (**).",
                 },
                 {"role": "user", "content": text},
             ],
@@ -5215,48 +5362,60 @@ async def process_state_text(text: str, msg, user, context: ContextTypes.DEFAULT
         return
 
     if state == "WAIT_DIET_PLAN":
-        wait_m = await msg.reply_text("⏳ <b>আপনার জন্য দেশি খাবারের পূর্ণাঙ্গ ডায়েট চার্ট তৈরি হচ্ছে, একটু অপেক্ষা করুন...</b>", parse_mode=ParseMode.HTML)
+        wait_m = await msg.reply_text("⏳ <b>আপনার জন্য ঘরোয়া দেশি খাবারের ডায়েট চার্ট তৈরি হচ্ছে, একটু অপেক্ষা করুন...</b>", parse_mode=ParseMode.HTML)
         out = await asyncio.to_thread(
             call_groq_chat,
             [
                 {
                     "role": "system",
                     "content": (
-                        "You are a certified Bangladeshi nutritionist. Create a practical daily Bangladeshi food diet chart in Bangla "
-                        "(🌅 সকালের নাস্তা, 🍎 মধ্য-সকাল, 🍛 দুপুরের খাবার, ☕ বিকেলের নাস্তা, 🌙 রাতের খাবার, এবং 💧 জরুরি পরামর্শ) "
-                        "tailored to the user's age, weight, and goal. Do not use raw asterisks (**)."
+                        "তুমি একজন অভিজ্ঞ বাংলাদেশী পুষ্টিবিদ। ইউজারের বয়স, ওজন ও লক্ষ্য অনুযায়ী সহজ তালিকা আকারে (Bullet points) প্রতিদিনের ডায়েট চার্ট তৈরি করে দাও:\n"
+                        "🌅 সকালের নাস্তা:\n"
+                        "🍎 দুপুরের আগের হালকা খাবার:\n"
+                        "🍛 দুপুরের খাবার:\n"
+                        "☕ বিকেলের নাস্তা:\n"
+                        "🌙 রাতের খাবার:\n"
+                        "💧 জরুরি পরামর্শ:\n\n"
+                        "কঠোর নিয়মাবলী (অবশ্যই মানতে হবে):\n"
+                        "১. ভুলেও কোনো টেবিল (Table বা | চিহ্ন) ব্যবহার করবে না—সাধারণ তালিকা আকারে পরিষ্কারভাবে লিখবে।\n"
+                        "২. কুইনোয়া (Quinoa), ওটস (Oats), টুনা ফিশ (Tuna), স্যামন, অ্যাভোকাডো, ব্রকলি, চিয়া সিড, অলিভ অয়েল—এই ধরনের কোনো বিদেশি খাবার একদমই লিখবে না!\n"
+                        "৩. শুধুমাত্র বাংলাদেশের সাধারণ মানুষের প্রতিদিনের সহজলভ্য দেশি খাবার দেবে: যেমন ভাত, লাল আটার রুটি, ডাল, ডিম, দেশি মাছ (রুই, তেলাপিয়া, শিং), মুরগির মাংস, সবজি ভাজি বা ঝোল, শাক, মুড়ি, ছোলা, শসা, পেয়ারা, কলা, পেঁপে, দুধ, টক দই ও লেবু পানি।\n"
+                        "৪. কোনো ** চিহ্ন ব্যবহার করবে না।"
                     ),
                 },
                 {"role": "user", "content": text},
             ],
-            0.5,
+            0.45,
         )
         add_points(user.id, 1)
         await wait_m.edit_text(
-            f"🥗 <b>আপনার পার্সোনালাইজড ডায়েট ও স্বাস্থ্য চার্ট</b>\n{DIVIDER}\n<blockquote>{html.escape(clean_ai_text(out))}</blockquote>",
+            f"🥗 <b>আপনার দেশি খাবারের ডায়েট ও স্বাস্থ্য চার্ট</b>\n{DIVIDER}\n<blockquote>{html.escape(clean_ai_text(out))}</blockquote>",
             parse_mode=ParseMode.HTML,
         )
         return
 
     if state == "WAIT_BIZ_IDEA":
-        wait_m = await msg.reply_text("⏳ <b>আপনার জন্য সেরা বিজনেস আইডিয়া ও ব্র্যান্ড নাম তৈরি হচ্ছে, একটু অপেক্ষা করুন...</b>", parse_mode=ParseMode.HTML)
+        wait_m = await msg.reply_text("⏳ <b>আপনার জন্য সহজ বিজনেস আইডিয়া ও গাইড তৈরি হচ্ছে, একটু অপেক্ষা করুন...</b>", parse_mode=ParseMode.HTML)
         out = await asyncio.to_thread(
             call_groq_chat,
             [
                 {
                     "role": "system",
                     "content": (
-                        "You are a Bangladeshi startup & business consultant. Provide actionable, profitable business ideas or 10 catchy brand/page names "
-                        "with budget breakdown, marketing tips, and profit potential in clear Bangla. Do not use raw asterisks (**)."
+                        "তুমি একজন অভিজ্ঞ বাংলাদেশী ব্যবসা পরামর্শদাতা। ইউজারের বাজেট বা পছন্দ অনুযায়ী একদম সহজ ও সাধারণ বাংলা লেখায় (তালিকা আকারে) ব্যবসার আইডিয়া বা পেজের সুন্দর নাম সাজিয়ে দাও।\n"
+                        "কঠোর নিয়ম:\n"
+                        "১. কখনোই কোনো টেবিল (Table বা | চিহ্ন) ব্যবহার করবে না! সাধারণ প্যারাগ্রাফ ও পয়েন্ট আকারে সহজ বাংলায় লিখবে।\n"
+                        "২. কীভাবে শুরু করবে, কত টাকা পুঁজি লাগবে, কোথা থেকে পণ্য আনবে এবং কীভাবে বিক্রি বা মার্কেটিং করবে তা সাধারণ মানুষের ভাষায় বুঝিয়ে দেবে।\n"
+                        "৩. কোনো ** চিহ্ন ব্যবহার করবে না।"
                     ),
                 },
                 {"role": "user", "content": text},
             ],
-            0.65,
+            0.6,
         )
         add_points(user.id, 1)
         await wait_m.edit_text(
-            f"💼 <b>বিজনেস আইডিয়া ও ব্র্যান্ড গাইড</b>\n{DIVIDER}\n<blockquote>{html.escape(clean_ai_text(out))}</blockquote>",
+            f"💼 <b>বিজনেস আইডিয়া ও গাইড</b>\n{DIVIDER}\n<blockquote>{html.escape(clean_ai_text(out))}</blockquote>",
             parse_mode=ParseMode.HTML,
         )
         return
