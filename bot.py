@@ -7,7 +7,8 @@ Tech stack:
 - Flask background keep-alive server on PORT (default 10000)
 - SQLite database (bigbot.db)
 - Groq API (dynamic model discovery & fallback, Whisper STT)
-- 30+ Tools, Points/Levels, Referral, Daily Bonus, Spin, Quiz, Shop, Force Join, Admin Panel
+- 36+ Tools, Multi-Engine Video Downloader (TikWM + Cobalt + yt-dlp),
+  Points/Levels, Referral, Daily Bonus, Spin, Quiz, Shop, Force Join, Full Interactive Admin Panel
 """
 
 import asyncio
@@ -27,6 +28,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import unicodedata
 import urllib.parse
 import xml.etree.ElementTree as ET
 from typing import Any, Dict, List, Optional, Tuple
@@ -124,7 +126,7 @@ def run_flask() -> None:
 
 
 # ---------------------------------------------------------------------------
-# BANGLA DIGIT CONVERSION HELPER
+# BANGLA DIGIT & TEXT NORMALIZATION HELPERS
 # ---------------------------------------------------------------------------
 BN_TO_EN_DIGITS = str.maketrans("০১২৩৪৫৬৭৮৯", "0123456789")
 EN_TO_BN_DIGITS = str.maketrans("0123456789", "০১২৩৪৫৬৭৮৯")
@@ -142,8 +144,19 @@ def en_to_bn_digits(text: str) -> str:
     return str(text).translate(EN_TO_BN_DIGITS)
 
 
+def normalize_btn_text(text: str) -> str:
+    """
+    Normalizes button text by removing zero-width joiners (\u200d) and variation selectors (\ufe0f)
+    so buttons work 100% reliably across Android, iOS, and Desktop Telegram clients!
+    """
+    if not text:
+        return ""
+    cleaned = text.replace("\u200d", "").replace("\ufe0f", "").replace("\u200c", "")
+    return " ".join(cleaned.split())
+
+
 # ---------------------------------------------------------------------------
-# PERSISTENT MENU KEYBOARD (EXACT ORDER & LABELS, 2 PER ROW)
+# PERSISTENT MENU KEYBOARD (PREMIUM LOOK + EXTRA USEFUL TOOLS + ADMIN PANEL)
 # ---------------------------------------------------------------------------
 BTN_AI_CHAT = "🤖 AI চ্যাট"
 BTN_TTS = "🎙️ Voice বানান"
@@ -175,6 +188,14 @@ BTN_PASSWORD = "🔐 পাসওয়ার্ড"
 BTN_DUA = "🤲 আজকের দোয়া"
 BTN_REMINDER = "⏰ রিমাইন্ডার"
 BTN_QUIZ = "🧠 কুইজ খেলুন"
+# 6 New High-Utility Tools
+BTN_GRAMMAR = "📝 বানান ও Grammar"
+BTN_EMAIL_CV = "📧 ইমেইল / আবেদনপত্র"
+BTN_CODE_HELP = "💻 কোড জেনারেটর"
+BTN_BIO_GEN = "🪪 স্টাইলিশ বায়ো"
+BTN_DREAM_ISLAM = "🌙 স্বপ্ন ও ইসলামিক প্রশ্ন"
+BTN_MATH_SOLVE = "🧮 অংক ও বিজ্ঞান সমাধান"
+# Shop, Engagement & System Buttons
 BTN_SHOP = "🛍️ শপ"
 BTN_CONTACT = "📩 Contact Admin"
 BTN_PROFILE = "👤 প্রোফাইল"
@@ -185,10 +206,11 @@ BTN_REFER = "👥 রেফার করুন"
 BTN_ABOUT = "ℹ️ About"
 BTN_HELP = "❓ Help"
 BTN_DEV = "👨💻 Developer"
+BTN_ADMIN_PANEL = "🛠️ Admin Panel"
 BTN_MENU = "🏠 মেনু"
 BTN_MAKE_PDF_DONE = "✅ PDF বানান"
 
-MAIN_MENU_LAYOUT = [
+BASE_MENU_LAYOUT = [
     [KeyboardButton(BTN_AI_CHAT), KeyboardButton(BTN_TTS)],
     [KeyboardButton(BTN_STT), KeyboardButton(BTN_AI_IMG)],
     [KeyboardButton(BTN_VID_DL), KeyboardButton(BTN_TRANSLATE)],
@@ -204,22 +226,65 @@ MAIN_MENU_LAYOUT = [
     [KeyboardButton(BTN_COMPRESS), KeyboardButton(BTN_LYRICS)],
     [KeyboardButton(BTN_PASSWORD), KeyboardButton(BTN_DUA)],
     [KeyboardButton(BTN_REMINDER), KeyboardButton(BTN_QUIZ)],
+    [KeyboardButton(BTN_GRAMMAR), KeyboardButton(BTN_EMAIL_CV)],
+    [KeyboardButton(BTN_CODE_HELP), KeyboardButton(BTN_BIO_GEN)],
+    [KeyboardButton(BTN_DREAM_ISLAM), KeyboardButton(BTN_MATH_SOLVE)],
     [KeyboardButton(BTN_SHOP), KeyboardButton(BTN_CONTACT)],
     [KeyboardButton(BTN_PROFILE), KeyboardButton(BTN_LEADERBOARD)],
     [KeyboardButton(BTN_DAILY), KeyboardButton(BTN_SPIN)],
     [KeyboardButton(BTN_REFER), KeyboardButton(BTN_ABOUT)],
     [KeyboardButton(BTN_HELP), KeyboardButton(BTN_DEV)],
-    [KeyboardButton(BTN_MENU)],
 ]
 
-MAIN_MENU_MARKUP = ReplyKeyboardMarkup(MAIN_MENU_LAYOUT, resize_keyboard=True)
+
+def get_main_menu_markup(user_id: Optional[int] = None) -> ReplyKeyboardMarkup:
+    rows = [list(r) for r in BASE_MENU_LAYOUT]
+    if user_id and is_admin(user_id):
+        rows.append([KeyboardButton(BTN_ADMIN_PANEL), KeyboardButton(BTN_MENU)])
+    else:
+        rows.append([KeyboardButton(BTN_MENU)])
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True)
+
+
+MAIN_MENU_MARKUP = get_main_menu_markup()
 
 PDF_COLLECT_MARKUP = ReplyKeyboardMarkup(
     [[KeyboardButton(BTN_MAKE_PDF_DONE)], [KeyboardButton(BTN_MENU)]],
     resize_keyboard=True,
 )
 
-ALL_MENU_BUTTONS = {btn.text for row in MAIN_MENU_LAYOUT for btn in row} | {BTN_MAKE_PDF_DONE}
+ALL_BUTTON_CONSTANTS = [
+    BTN_AI_CHAT, BTN_TTS, BTN_STT, BTN_AI_IMG,
+    BTN_VID_DL, BTN_TRANSLATE, BTN_CAPTION, BTN_STORY,
+    BTN_IMG_PDF, BTN_PDF_SUM, BTN_PRAYER, BTN_WEATHER,
+    BTN_CURRENCY, BTN_SHORTURL, BTN_DICT, BTN_JOKES,
+    BTN_BMI, BTN_QR, BTN_NEWS, BTN_CRYPTO,
+    BTN_AGE, BTN_UNIT, BTN_FANCY, BTN_LOVE,
+    BTN_COMPRESS, BTN_LYRICS, BTN_PASSWORD, BTN_DUA,
+    BTN_REMINDER, BTN_QUIZ,
+    BTN_GRAMMAR, BTN_EMAIL_CV, BTN_CODE_HELP, BTN_BIO_GEN,
+    BTN_DREAM_ISLAM, BTN_MATH_SOLVE,
+    BTN_SHOP, BTN_CONTACT, BTN_PROFILE, BTN_LEADERBOARD,
+    BTN_DAILY, BTN_SPIN, BTN_REFER, BTN_ABOUT,
+    BTN_HELP, BTN_DEV, BTN_ADMIN_PANEL, BTN_MENU, BTN_MAKE_PDF_DONE,
+]
+
+NORMALIZED_BUTTON_MAP: Dict[str, str] = {
+    normalize_btn_text(b): b for b in ALL_BUTTON_CONSTANTS
+}
+# Additional fallback aliases for Developer / Admin buttons
+NORMALIZED_BUTTON_MAP[normalize_btn_text("👨‍💻 Developer")] = BTN_DEV
+NORMALIZED_BUTTON_MAP[normalize_btn_text("👨💻 Developer")] = BTN_DEV
+NORMALIZED_BUTTON_MAP[normalize_btn_text("🛠 Admin Panel")] = BTN_ADMIN_PANEL
+
+
+def match_menu_button(raw_text: str) -> Optional[str]:
+    if not raw_text:
+        return None
+    norm = normalize_btn_text(raw_text)
+    if norm in NORMALIZED_BUTTON_MAP:
+        return NORMALIZED_BUTTON_MAP[norm]
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -379,6 +444,18 @@ def get_total_users() -> int:
 def get_total_orders() -> int:
     with get_db() as conn:
         row = conn.execute("SELECT COUNT(*) AS cnt FROM orders").fetchone()
+        return int(row["cnt"]) if row else 0
+
+
+def get_total_banned() -> int:
+    with get_db() as conn:
+        row = conn.execute("SELECT COUNT(*) AS cnt FROM users WHERE banned = 1").fetchone()
+        return int(row["cnt"]) if row else 0
+
+
+def get_total_premium() -> int:
+    with get_db() as conn:
+        row = conn.execute("SELECT COUNT(*) AS cnt FROM users WHERE premium = 1").fetchone()
         return int(row["cnt"]) if row else 0
 
 
@@ -549,25 +626,21 @@ def select_groq_chat_model(force_refresh: bool = False) -> str:
     available = fetch_groq_models(force_refresh=force_refresh)
     available_set = set(available)
 
-    # 1. If GROQ_MODEL env is set and available, use it
     if GROQ_MODEL_ENV and (not available_set or GROQ_MODEL_ENV in available_set):
         _cached_groq_selected = GROQ_MODEL_ENV
         return _cached_groq_selected
 
-    # 2. Pick in preference order
     for candidate in GROQ_PREFERRED_MODELS:
         if candidate in available_set:
             _cached_groq_selected = candidate
             return _cached_groq_selected
 
-    # 3. Fallback to any non-whisper/non-guard chat model if none of preferred found
     for m in available:
         lower_m = m.lower()
         if "whisper" not in lower_m and "guard" not in lower_m and "tts" not in lower_m:
             _cached_groq_selected = m
             return _cached_groq_selected
 
-    # 4. Ultimate fallback if model list call itself failed
     _cached_groq_selected = GROQ_MODEL_ENV or GROQ_PREFERRED_MODELS[0]
     return _cached_groq_selected
 
@@ -604,7 +677,6 @@ def call_groq_chat(
             model = select_groq_chat_model(force_refresh=True)
             continue
 
-        # If json_mode is unsupported by a specific model, retry without response_format
         if resp.status_code == 400 and json_mode and attempt == 0:
             json_mode = False
             continue
@@ -654,15 +726,12 @@ def call_groq_whisper(file_path: str) -> str:
 # ---------------------------------------------------------------------------
 def remove_bottom_watermark_and_polish(img_bytes: bytes) -> bytes:
     """
-    Guarantees 100% watermark-free AI images.
-    Pollinations sometimes burns a small logo strip in the bottom-right / bottom 6%
-    even when ?nologo=true is passed. We request a slightly taller image (or standard 1024)
-    and cleanly crop out the bottom watermark zone, then resize to a crisp 1024x1024 JPEG.
+    Guarantees 100% watermark-free AI images by cropping the bottom watermark zone
+    and resizing to a crisp 1024x1024 JPEG.
     """
     with Image.open(io.BytesIO(img_bytes)) as im:
         rgb = im.convert("RGB")
         w, h = rgb.size
-        # Crop bottom 6.5% where any watermark/logo badge sits, and center-crop width slightly to keep aspect ratio
         crop_bottom = int(h * 0.935)
         margin_x = int(w * 0.0325)
         cropped = rgb.crop((margin_x, 0, w - margin_x, crop_bottom))
@@ -736,12 +805,12 @@ ABOUT_TEXT = (
     "২. <b>🎙️ Voice বানান</b> — যেকোনো লেখা থেকে বাংলা (নারী/পুরুষ) ও ইংরেজি ভয়েস তৈরি\n"
     "৩. <b>🎤 Voice → Text</b> — ভয়েস মেসেজ থেকে অটোমেটিক বাংলা/ইংরেজি টেক্সট রূপান্তর\n"
     "৪. <b>🖼️ AI ছবি</b> — ১০০% লোগো ও ওয়াটারমার্ক-মুক্ত HD ছবি তৈরি\n"
-    "৫. <b>📥 ভিডিও ডাউনলোড</b> — TikTok (HD), YouTube, FB, Insta ভিডিও ডাউনলোড\n"
+    "৫. <b>📥 ভিডিও ডাউনলোড</b> — TikTok, YouTube, Facebook, Instagram ভিডিও ডাউনলোড\n"
     "৬. <b>🌐 অনুবাদ</b> — বাংলা ↔ English নিখুঁত অনুবাদ\n"
     "৭. <b>✍️ Caption বানান</b> — ইমোজি ও হ্যাশট্যাগসহ ৫টি ভাইরাল বাংলা ক্যাপশন\n"
     "৮. <b>📖 গল্প / কবিতা</b> — যেকোনো টপিকে বাংলা গল্প বা কবিতা রচনা"
     "</blockquote>\n\n"
-    "📂 <b>ডকুমেন্ট ও ইউটিলিটি টুলস:</b>\n"
+    "📂 <b>ডকুমেন্ট ও প্রোডাক্টিভিটি টুলস:</b>\n"
     "<blockquote>"
     "৯. <b>🖼️ ছবি → PDF</b> — একাধিক ছবি একত্র করে PDF ফাইল তৈরি\n"
     "১০. <b>📄 PDF Summary</b> — যেকোনো PDF ফাইলের বাংলা মূল সারাংশ\n"
@@ -764,21 +833,28 @@ ABOUT_TEXT = (
     "২৭. <b>🔐 পাসওয়ার্ড</b> — ৮, ১২ বা ১৬ অক্ষরের শক্তিশালী পাসওয়ার্ড তৈরি\n"
     "২৮. <b>🤲 আজকের দোয়া</b> — আরবি ও বাংলা অর্থসহ প্রতিদিন একটি মাসনুন দোয়া\n"
     "২৯. <b>⏰ রিমাইন্ডার</b> — নির্দিষ্ট সময় পর কাজের কথা মনে করিয়ে দেওয়ার অ্যালার্ম\n"
-    "৩০. <b>🧠 কুইজ খেলুন</b> — ৫টি বাংলা সাধারণ জ্ঞানের কুইজ খেলে পয়েন্ট অর্জন"
+    "৩০. <b>🧠 কুইজ খেলুন</b> — ৫টি বাংলা সাধারণ জ্ঞানের কুইজ খেলে পয়েন্ট অর্জন\n"
+    "৩১. <b>📝 বানান ও Grammar</b> — বাংলা বা ইংরেজি বাক্যের বানান ও গ্রামার সংশোধন\n"
+    "৩২. <b>📧 ইমেইল / আবেদনপত্র</b> — প্রফেশনাল ইমেইল, দরখাস্ত ও CV কভার লেটার তৈরি\n"
+    "৩৩. <b>💻 কোড জেনারেটর</b> — যেকোনো প্রোগ্রামিং কোড লেখা ও বাগ ফিক্স করা\n"
+    "৩৪. <b>🪪 স্টাইলিশ বায়ো</b> — FB, Insta ও Telegram প্রোফাইলের জন্য ভিআইপি বায়ো\n"
+    "৩৫. <b>🌙 স্বপ্ন ও ইসলামিক প্রশ্ন</b> — কুরআন ও হাদিসের আলোকে ইসলামিক প্রশ্নোত্তর\n"
+    "৩৬. <b>🧮 অংক ও বিজ্ঞান সমাধান</b> — যেকোনো গাণিতিক বা বিজ্ঞানের প্রশ্নের ধাপে ধাপে সমাধান"
     "</blockquote>\n\n"
-    "🎁 <b>শপ, প্রোফাইল ও অন্যান্য:</b>\n"
+    "🎁 <b>শপ, প্রোফাইল ও কন্ট্রোল:</b>\n"
     "<blockquote>"
-    "৩১. <b>🛍️ শপ</b> — বট স্টোর থেকে পণ্য দেখা ও অর্ডার করা\n"
-    "৩২. <b>📩 Contact Admin</b> — সরাসরি অ্যাডমিনের সাথে মেসেজে কথা বলা\n"
-    "৩৩. <b>👤 প্রোফাইল</b> — নিজের পয়েন্ট, লেভেল, র‍্যাংক ও রেফারেল লিংক\n"
-    "৩৪. <b>🏆 লিডারবোর্ড</b> — সর্বকালের সেরা ১০ ও সাপ্তাহিক সেরা ৫ জনের তালিকা\n"
-    "৩৫. <b>🎁 ডেইলি বোনাস</b> — প্রতিদিন ফ্রি +৫ পয়েন্ট বোনাস\n"
-    "৩৬. <b>🎰 স্পিন</b> — প্রতিদিন লাকি স্পিনে ১–৫০ পয়েন্ট জয়ের সুযোগ\n"
-    "৩৭. <b>👥 রেফার করুন</b> — বন্ধু আমন্ত্রণ জানিয়ে প্রতি রেফারে +১০ পয়েন্ট\n"
-    "৩৮. <b>ℹ️ About</b> — বটের সকল বাটনের বিস্তারিত তালিকা\n"
-    "৩৯. <b>❓ Help</b> — বট ব্যবহারের গাইডলাইন ও নিয়মাবলী\n"
-    "৪০. <b>👨💻 Developer</b> — বট নির্মাতার পরিচিতি\n"
-    "৪১. <b>🏠 মেনু</b> — যেকোনো টুল থেকে মূল মেনুতে ফিরে আসা"
+    "৩৭. <b>🛍️ শপ</b> — বট স্টোর থেকে পণ্য দেখা ও অর্ডার করা\n"
+    "৩৮. <b>📩 Contact Admin</b> — সরাসরি অ্যাডমিনের সাথে মেসেজে কথা বলা\n"
+    "৩৯. <b>👤 প্রোফাইল</b> — নিজের পয়েন্ট, লেভেল, র‍্যাংক ও রেফারেল লিংক\n"
+    "৪০. <b>🏆 লিডারবোর্ড</b> — সর্বকালের সেরা ১০ ও সাপ্তাহিক সেরা ৫ জনের তালিকা\n"
+    "৪১. <b>🎁 ডেইলি বোনাস</b> — প্রতিদিন ফ্রি +৫ পয়েন্ট বোনাস\n"
+    "৪২. <b>🎰 স্পিন</b> — প্রতিদিন লাকি স্পিনে ১–৫০ পয়েন্ট জয়ের সুযোগ\n"
+    "৪৩. <b>👥 রেফার করুন</b> — বন্ধু আমন্ত্রণ জানিয়ে প্রতি রেফারে +১০ পয়েন্ট\n"
+    "৪৪. <b>ℹ️ About</b> — বটের সকল বাটনের বিস্তারিত তালিকা\n"
+    "৪৫. <b>❓ Help</b> — বট ব্যবহারের গাইডলাইন ও নিয়মাবলী\n"
+    "৪৬. <b>👨💻 Developer</b> — বট নির্মাতার পরিচিতি\n"
+    "৪৭. <b>🛠️ Admin Panel</b> — অ্যাডমিনদের জন্য সরাসরি কন্ট্রোল প্যানেল বাটন\n"
+    "৪৮. <b>🏠 মেনু</b> — যেকোনো টুল থেকে মূল মেনুতে ফিরে আসা"
     "</blockquote>"
 )
 
@@ -805,7 +881,8 @@ HELP_TEXT = (
     "⌨️ <b>শর্টকাট কমান্ড:</b>\n"
     "• <code>/start</code> — বট রিস্টার্ট ও মূল মেনু\n"
     "• <code>/help</code> — ব্যবহারের নির্দেশিকা\n"
-    "• <code>/myid</code> — আপনার টেলিগ্রাম আইডি দেখুন\n\n"
+    "• <code>/myid</code> — আপনার টেলিগ্রাম আইডি দেখুন\n"
+    "• <code>/admin</code> — অ্যাডমিন প্যানেল (শুধুমাত্র অ্যাডমিন)\n\n"
     "💡 <i>যেকোনো চলমান কাজ বাতিল করতে নিচের <b>🏠 মেনু</b> বাটনে চাপুন।</i>"
 )
 
@@ -822,9 +899,6 @@ def extract_first_url(text: str) -> Optional[str]:
 
 
 def format_12h(time_24: str) -> str:
-    """
-    Converts '05:12' or '05:12 (BST)' into '05:12 AM'
-    """
     clean = time_24.split(" ")[0].strip()
     try:
         dt = datetime.datetime.strptime(clean, "%H:%M")
@@ -859,10 +933,6 @@ WEATHER_CODE_MAP = {
 
 
 def fetch_weather_info(city: str) -> str:
-    """
-    Geocode with Open-Meteo geocoding API, then forecast API.
-    Retry 3 times with delays on 429/error, then fallback to wttr.in/<city>?format=j1.
-    """
     city_clean = city.strip()
     headers = {"User-Agent": "Mozilla/5.0 (compatible; BigBot/1.0)"}
 
@@ -920,7 +990,6 @@ def fetch_weather_info(city: str) -> str:
             logger.warning(f"Open-Meteo attempt {attempt + 1} failed: {e}")
             time.sleep(1.2 * (attempt + 1))
 
-    # Fallback: wttr.in
     wttr_url = f"https://wttr.in/{urllib.parse.quote(city_clean)}?format=j1"
     w_resp = requests.get(wttr_url, headers=headers, timeout=15)
     w_resp.raise_for_status()
@@ -1251,13 +1320,6 @@ def calculate_age_response(raw_text: str) -> str:
 
 
 def parse_reminder_input(raw_text: str) -> Optional[Tuple[int, str]]:
-    """
-    Parses inputs like:
-    - "10 মিনিট পরে পানি খাবো"
-    - "30 minute por ghumabo"
-    - "1 ghonta pore call"
-    Returns (seconds, reminder_text) or None.
-    """
     text = bn_to_en_digits(raw_text.strip())
     pattern = re.compile(
         r"^\s*(\d+)\s*"
@@ -1368,11 +1430,6 @@ def fetch_google_news_bn() -> str:
 
 
 async def generate_tts_voice(text: str, voice: str) -> str:
-    """
-    Generates an OGG/MP3 audio file using edge-tts (retries 3 times),
-    falls back to gTTS if edge-tts fails 3 times, and converts with ffmpeg if needed.
-    Returns path to generated audio file.
-    """
     tmp_mp3 = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3").name
     edge_ok = False
 
@@ -1416,16 +1473,56 @@ async def generate_tts_voice(text: str, voice: str) -> str:
     return tmp_mp3
 
 
+# ---------------------------------------------------------------------------
+# MULTI-ENGINE VIDEO DOWNLOADER (TIKTOK + YOUTUBE + FACEBOOK + INSTAGRAM)
+# ---------------------------------------------------------------------------
+def _stream_download_file(stream_url: str, out_path: str) -> bool:
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+        )
+    }
+    with requests.get(stream_url, headers=headers, stream=True, timeout=60) as r:
+        r.raise_for_status()
+        total_bytes = 0
+        with open(out_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=65536):
+                if chunk:
+                    total_bytes += len(chunk)
+                    if total_bytes > 50 * 1024 * 1024:
+                        raise ValueError("FILE_TOO_LARGE")
+                    f.write(chunk)
+    return os.path.exists(out_path) and os.path.getsize(out_path) > 1000
+
+
 def download_video_from_url(url: str) -> Tuple[str, str]:
     """
-    Downloads video under 50MB.
-    For tiktok.com links, tries tikwm API first (hdplay or play).
-    Falls back to yt-dlp limited to <46MB mp4.
-    Returns (file_path, title).
+    Multi-stage resilient video downloader for Render cloud IPs:
+    1. TikTok -> tikwm API first (hdplay or play)
+    2. Cobalt multi-instance social media API (bypasses YouTube/Facebook/Instagram datacenter blocks)
+    3. yt-dlp with bundled imageio-ffmpeg binary, mobile/android/tv player_client bypass,
+       and automatic redirect resolution for fb.watch / share/v / share/r links.
     """
     tmp_dir = tempfile.mkdtemp(prefix="vid_")
+    ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
 
-    if "tiktok.com" in url.lower():
+    # Resolve short redirects (e.g., fb.watch, facebook.com/share/r/..., vm.tiktok.com)
+    resolved_url = url
+    try:
+        r_head = requests.head(
+            url,
+            allow_redirects=True,
+            timeout=10,
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+        )
+        if r_head.url and r_head.url.startswith("http"):
+            resolved_url = r_head.url
+    except Exception:
+        pass
+
+    # Stage 1: TikTok via tikwm API first
+    if "tiktok.com" in resolved_url.lower() or "tiktok.com" in url.lower():
         try:
             api_url = f"https://www.tikwm.com/api/?url={urllib.parse.quote(url)}&hd=1"
             resp = requests.get(api_url, timeout=20)
@@ -1437,50 +1534,126 @@ def download_video_from_url(url: str) -> Tuple[str, str]:
                 if play_url:
                     if play_url.startswith("/"):
                         play_url = "https://www.tikwm.com" + play_url
-                    v_resp = requests.get(play_url, stream=True, timeout=60)
-                    v_resp.raise_for_status()
                     out_path = os.path.join(tmp_dir, "tiktok.mp4")
-                    total_bytes = 0
-                    with open(out_path, "wb") as f:
-                        for chunk in v_resp.iter_content(chunk_size=65536):
-                            if chunk:
-                                total_bytes += len(chunk)
-                                if total_bytes > 50 * 1024 * 1024:
-                                    raise ValueError("FILE_TOO_LARGE")
-                                f.write(chunk)
-                    if os.path.exists(out_path) and os.path.getsize(out_path) > 1000:
+                    if _stream_download_file(play_url, out_path):
                         return out_path, title
         except ValueError as ve:
             if str(ve) == "FILE_TOO_LARGE":
                 raise
         except Exception as e:
-            logger.warning(f"tikwm API failed, falling back to yt-dlp: {e}")
+            logger.warning(f"tikwm API failed, trying next engine: {e}")
 
+    # Stage 2: Cobalt API instances (great for YouTube, Facebook Reels/Watch, Instagram on cloud IPs)
+    cobalt_endpoints = [
+        "https://api.cobalt.tools/",
+        "https://cobalt-api.kwiatekmiki.com/",
+        "https://cobalt-backend.canine.tools/",
+    ]
+    for cob_url in cobalt_endpoints:
+        try:
+            c_resp = requests.post(
+                cob_url,
+                json={
+                    "url": resolved_url,
+                    "videoQuality": "720",
+                    "filenameStyle": "basic",
+                },
+                headers={
+                    "Accept": "application/json",
+                    "Content-Type": "application/json",
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                },
+                timeout=18,
+            )
+            if c_resp.status_code == 200:
+                c_data = c_resp.json()
+                dl_link = c_data.get("url")
+                if dl_link:
+                    out_path = os.path.join(tmp_dir, "social_video.mp4")
+                    if _stream_download_file(dl_link, out_path):
+                        return out_path, c_data.get("filename") or "Downloaded Video"
+        except ValueError as ve:
+            if str(ve) == "FILE_TOO_LARGE":
+                raise
+        except Exception as e:
+            logger.debug(f"Cobalt instance {cob_url} skipped: {e}")
+
+    # Stage 3: yt-dlp with ffmpeg_location and multi-client configurations for FB / YT / IG
     out_tmpl = os.path.join(tmp_dir, "video.%(ext)s")
-    ydl_opts = {
-        "format": "best[filesize<46M][ext=mp4]/best[filesize_approx<46M][ext=mp4]/best[ext=mp4]/best",
-        "outtmpl": out_tmpl,
-        "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
-        "max_filesize": 50 * 1024 * 1024,
-    }
+    client_profiles = [
+        # Profile A: Android/iOS player client (bypasses most YouTube bot checks) + ffmpeg merge
+        {
+            "format": (
+                "best[filesize<46M][ext=mp4]/"
+                "best[filesize_approx<46M][ext=mp4]/"
+                "bestvideo[filesize<35M][ext=mp4]+bestaudio[filesize<10M][ext=m4a]/"
+                "best[height<=720][ext=mp4]/best[ext=mp4]/best"
+            ),
+            "extractor_args": {"youtube": {"player_client": ["android", "ios", "tv", "web"]}},
+            "http_headers": {
+                "User-Agent": (
+                    "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
+                )
+            },
+        },
+        # Profile B: Desktop browser headers (helpful for Facebook Watch / public Reels)
+        {
+            "format": "best[height<=720][ext=mp4]/best[ext=mp4]/best",
+            "http_headers": {
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+                ),
+                "Accept-Language": "en-US,en;q=0.9",
+            },
+        },
+    ]
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        title = info.get("title", "Downloaded Video") if info else "Downloaded Video"
-        downloaded_path = ydl.prepare_filename(info)
+    last_err: Optional[Exception] = None
+    for profile in client_profiles:
+        for target in (resolved_url, url):
+            try:
+                ydl_opts: Dict[str, Any] = {
+                    "outtmpl": out_tmpl,
+                    "noplaylist": True,
+                    "quiet": True,
+                    "no_warnings": True,
+                    "nocheckcertificate": True,
+                    "geo_bypass": True,
+                    "ffmpeg_location": ffmpeg_exe,
+                    "merge_output_format": "mp4",
+                    "max_filesize": 50 * 1024 * 1024,
+                    "socket_timeout": 25,
+                    "retries": 3,
+                }
+                ydl_opts.update(profile)
 
-    if not os.path.exists(downloaded_path):
-        files = [os.path.join(tmp_dir, f) for f in os.listdir(tmp_dir)]
-        if not files:
-            raise RuntimeError("Video download failed.")
-        downloaded_path = files[0]
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(target, download=True)
+                    title = info.get("title", "Downloaded Video") if info else "Downloaded Video"
+                    downloaded_path = ydl.prepare_filename(info)
 
-    if os.path.getsize(downloaded_path) > 50 * 1024 * 1024:
-        raise ValueError("FILE_TOO_LARGE")
+                if not os.path.exists(downloaded_path):
+                    files = [os.path.join(tmp_dir, f) for f in os.listdir(tmp_dir)]
+                    if files:
+                        downloaded_path = files[0]
 
-    return downloaded_path, title
+                if os.path.exists(downloaded_path) and os.path.getsize(downloaded_path) > 1000:
+                    if os.path.getsize(downloaded_path) > 50 * 1024 * 1024:
+                        raise ValueError("FILE_TOO_LARGE")
+                    return downloaded_path, title
+            except ValueError as ve:
+                if str(ve) == "FILE_TOO_LARGE":
+                    raise
+                last_err = ve
+            except Exception as e:
+                last_err = e
+                logger.warning(f"yt-dlp attempt failed for {target}: {e}")
+
+    if last_err:
+        raise last_err
+    raise RuntimeError("Video download failed across all engines.")
 
 
 # ---------------------------------------------------------------------------
@@ -1522,7 +1695,7 @@ def generate_quiz_questions() -> List[Dict[str, Any]]:
     return valid_questions[:5]
 
 
-async def send_quiz_question(message, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def send_quiz_question(message, context: ContextTypes.DEFAULT_TYPE, user_id: Optional[int] = None) -> None:
     quiz_state = context.user_data.get("quiz")
     if not quiz_state:
         return
@@ -1542,7 +1715,7 @@ async def send_quiz_question(message, context: ContextTypes.DEFAULT_TYPE) -> Non
             f"🏆 <b>অর্জিত মোট পয়েন্ট:</b> +{earned} পয়েন্ট"
             f"</blockquote>",
             parse_mode=ParseMode.HTML,
-            reply_markup=MAIN_MENU_MARKUP,
+            reply_markup=get_main_menu_markup(user_id),
         )
         return
 
@@ -1633,14 +1806,14 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"<blockquote>"
         f"👤 <b>আপনার লেভেল:</b> {lvl} ({en_to_bn_digits(str(pts))} পয়েন্ট)\n"
         f"👥 <b>মোট ব্যবহারকারী:</b> {en_to_bn_digits(str(total_users))} জন\n"
-        f"🛠️ <b>মোট সার্ভিস:</b> ৩০+ প্রিমিয়াম টুলস (সম্পূর্ণ ফ্রি)"
+        f"🛠️ <b>মোট সার্ভিস:</b> ৩৬+ প্রিমিয়াম টুলস (সম্পূর্ণ ফ্রি)"
         f"</blockquote>\n\n"
         f"👇 <b>নিচের মেনু থেকে আপনার পছন্দের সেবাটি বেছে নিন:</b>"
     )
     await update.effective_message.reply_text(
         welcome_msg,
         parse_mode=ParseMode.HTML,
-        reply_markup=MAIN_MENU_MARKUP,
+        reply_markup=get_main_menu_markup(user.id),
     )
 
 
@@ -1651,7 +1824,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(
         HELP_TEXT,
         parse_mode=ParseMode.HTML,
-        reply_markup=MAIN_MENU_MARKUP,
+        reply_markup=get_main_menu_markup(user.id),
     )
 
 
@@ -1666,10 +1839,11 @@ async def cmd_myid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # ---------------------------------------------------------------------------
-# ADMIN PANEL & ADMIN TEXT COMMANDS
+# ADMIN PANEL & ADMIN TEXT COMMANDS (FULL INTERACTIVE BUTTONS)
 # ---------------------------------------------------------------------------
 def build_admin_panel_markup() -> InlineKeyboardMarkup:
-    maint_status = "চালু (ON) 🟢" if is_maintenance_on() else "বন্ধ (OFF) 🔴"
+    maint_status = "ON 🟢" if is_maintenance_on() else "OFF 🔴"
+    prem_status = "ON 💎" if is_premium_mode_on() else "OFF 🆓"
     return InlineKeyboardMarkup(
         [
             [
@@ -1680,7 +1854,39 @@ def build_admin_panel_markup() -> InlineKeyboardMarkup:
                 InlineKeyboardButton("📢 চ্যানেল (Force Join)", callback_data="admin:channel"),
                 InlineKeyboardButton(f"🔧 Maintenance: {maint_status}", callback_data="admin:maint_toggle"),
             ],
+            [
+                InlineKeyboardButton("➕ পণ্য যোগ (Add Product)", callback_data="admin:add_prod"),
+                InlineKeyboardButton("🗑️ পণ্য ডিলিট (Del Product)", callback_data="admin:del_prod"),
+            ],
+            [
+                InlineKeyboardButton("🚫 Ban / Unban ইউজার", callback_data="admin:ban_user"),
+                InlineKeyboardButton("🎁 পয়েন্ট গিফট", callback_data="admin:add_pts"),
+            ],
+            [
+                InlineKeyboardButton("📦 অর্ডার লিস্ট (Orders)", callback_data="admin:orders"),
+                InlineKeyboardButton(f"💎 Premium Mode: {prem_status}", callback_data="admin:prem_toggle"),
+            ],
         ]
+    )
+
+
+async def send_admin_panel(message, user_id: int) -> None:
+    if not is_admin(user_id):
+        return
+    u_cnt = get_total_users()
+    o_cnt = get_total_orders()
+    ch = get_force_join_channel() or "OFF"
+    await message.reply_text(
+        f"🛠️ <b>অ্যাডমিন কন্ট্রোল প্যানেল (Admin Dashboard)</b>\n"
+        f"{DIVIDER}\n"
+        f"<blockquote>"
+        f"👥 <b>মোট ইউজার:</b> {u_cnt} জন  |  🛍️ <b>অর্ডার:</b> {o_cnt} টি\n"
+        f"📢 <b>Force Join:</b> {html.escape(ch)}\n"
+        f"🔧 <b>Maintenance:</b> {'ON 🟢' if is_maintenance_on() else 'OFF 🔴'}"
+        f"</blockquote>\n\n"
+        "👇 <b>নিচের বাটনগুলোতে ক্লিক করে সরাসরি সব কিছু নিয়ন্ত্রণ করুন:</b>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=build_admin_panel_markup(),
     )
 
 
@@ -1690,22 +1896,7 @@ async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     if not is_admin(user.id):
         return
-
-    await update.effective_message.reply_text(
-        f"🛠️ <b>অ্যাডমিন কন্ট্রোল প্যানেল (Admin Panel)</b>\n"
-        f"{DIVIDER}\n"
-        "<blockquote>"
-        "• <code>/ban &lt;id&gt;</code> | <code>/unban &lt;id&gt;</code>\n"
-        "• <code>/maintenance on|off</code>\n"
-        "• <code>/setchannel @ChannelName</code> | <code>/setchannel off</code>\n"
-        "• <code>/channel</code>\n"
-        "• <code>/premium &lt;id&gt; on|off</code>\n"
-        "• <code>/addproduct নাম|দাম|বিবরণ</code>\n"
-        "• <code>/delproduct &lt;id&gt;</code>"
-        "</blockquote>",
-        parse_mode=ParseMode.HTML,
-        reply_markup=build_admin_panel_markup(),
-    )
+    await send_admin_panel(update.effective_message, user.id)
 
 
 async def cmd_ban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1872,13 +2063,13 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             channel = get_force_join_channel()
             if not channel:
                 await query.answer("✅ ধন্যবাদ! এখন আপনি বট ব্যবহার করতে পারেন।", show_alert=True)
-                await query.message.reply_text("✅ মূল মেনু থেকে আপনার পছন্দের টুল বেছে নিন:", reply_markup=MAIN_MENU_MARKUP)
+                await query.message.reply_text("✅ মূল মেনু থেকে আপনার পছন্দের টুল বেছে নিন:", reply_markup=get_main_menu_markup(user.id))
                 return
 
             joined = await check_force_join(update, context)
             if joined:
                 await query.answer("✅ জয়েন নিশ্চিত হয়েছে! ধন্যবাদ।", show_alert=True)
-                await query.message.reply_text("✅ অভিনন্দন! এখন আপনি বটের সকল টুল ব্যবহার করতে পারবেন।", reply_markup=MAIN_MENU_MARKUP)
+                await query.message.reply_text("✅ অভিনন্দন! এখন আপনি বটের সকল টুল ব্যবহার করতে পারবেন।", reply_markup=get_main_menu_markup(user.id))
             else:
                 await query.answer("❌ আপনি এখনো চ্যানেলে জয়েন করেননি!", show_alert=True)
             return
@@ -1892,17 +2083,23 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             if action == "stats":
                 u_cnt = get_total_users()
                 o_cnt = get_total_orders()
+                b_cnt = get_total_banned()
+                p_cnt = get_total_premium()
                 ch = get_force_join_channel() or "OFF"
-                maint = "ON" if is_maintenance_on() else "OFF"
+                maint = "ON 🟢" if is_maintenance_on() else "OFF 🔴"
+                prem_m = "ON 💎" if is_premium_mode_on() else "OFF 🆓"
                 await query.answer()
                 await query.message.reply_text(
-                    f"📊 <b>বট পরিসংখ্যান (Live Stats)</b>\n"
+                    f"📊 <b>বট বিস্তারিত পরিসংখ্যান (Live Stats)</b>\n"
                     f"{DIVIDER}\n"
                     f"<blockquote>"
                     f"👥 <b>মোট ইউজার:</b> {u_cnt} জন\n"
+                    f"💎 <b>প্রিমিয়াম ইউজার:</b> {p_cnt} জন\n"
+                    f"🚫 <b>ব্যানড ইউজার:</b> {b_cnt} জন\n"
                     f"🛍️ <b>মোট অর্ডার:</b> {o_cnt} টি\n"
                     f"📢 <b>Force Join:</b> {html.escape(ch)}\n"
-                    f"🔧 <b>Maintenance:</b> {maint}"
+                    f"🔧 <b>Maintenance:</b> {maint}\n"
+                    f"👑 <b>Premium Mode:</b> {prem_m}"
                     f"</blockquote>",
                     parse_mode=ParseMode.HTML,
                 )
@@ -1912,19 +2109,19 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 await query.message.reply_text(
                     f"📢 <b>ব্রডকাস্ট মোড চালু হয়েছে</b>\n"
                     f"{DIVIDER}\n"
-                    "এখন যে মেসেজটি পাঠাবেন সেটি সকল ব্যবহারকারীর কাছে চলে যাবে (বাতিল করতে 🏠 মেনু চাপুন):",
+                    "<blockquote>এখন যে মেসেজ, ছবি বা ভিডিও পাঠাবেন সেটি সকল ব্যবহারকারীর কাছে চলে যাবে (বাতিল করতে 🏠 মেনু চাপুন):</blockquote>",
                     parse_mode=ParseMode.HTML,
                 )
             elif action == "channel":
                 ch = get_force_join_channel()
                 status_txt = f"বর্তমান চ্যানেল: <b>{html.escape(ch)}</b>" if ch else "বর্তমানে কোনো চ্যানেল সেট করা নেই (OFF)।"
+                context.user_data["state"] = "ADMIN_SET_CHANNEL"
                 await query.answer()
                 await query.message.reply_text(
                     f"📢 <b>চ্যানেল (Force Join) সেটিংস</b>\n"
                     f"{DIVIDER}\n"
-                    f"<blockquote>{status_txt}</blockquote>\n\n"
-                    f"🔹 চ্যানেল সেট করতে কমান্ড দিন:\n<code>/setchannel @ChannelName</code>\n"
-                    f"🔹 বন্ধ করতে কমান্ড দিন:\n<code>/setchannel off</code>",
+                    f"<blockquote>{status_txt}\n\n"
+                    f"✍️ এখন সরাসরি আপনার চ্যানেলের ইউজারনেম (যেমন <code>@MyChannel</code>) লিখে পাঠান, অথবা বন্ধ করতে <code>off</code> লিখে পাঠান:</blockquote>",
                     parse_mode=ParseMode.HTML,
                 )
             elif action == "maint_toggle":
@@ -1932,6 +2129,84 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 set_setting("maintenance", new_val)
                 await query.answer(f"Maintenance এখন {new_val.upper()}")
                 await query.edit_message_reply_markup(reply_markup=build_admin_panel_markup())
+            elif action == "prem_toggle":
+                new_val = "off" if is_premium_mode_on() else "on"
+                set_setting("premium_mode", new_val)
+                await query.answer(f"Premium Mode এখন {new_val.upper()}")
+                await query.edit_message_reply_markup(reply_markup=build_admin_panel_markup())
+            elif action == "add_prod":
+                context.user_data["state"] = "ADMIN_ADD_PRODUCT"
+                await query.answer()
+                await query.message.reply_text(
+                    f"➕ <b>নতুন পণ্য যোগ করুন</b>\n"
+                    f"{DIVIDER}\n"
+                    "<blockquote>নিচের ফরম্যাটে মেসেজ পাঠান:\n"
+                    "<code>পণ্য নাম | দাম | বিবরণ</code>\n\n"
+                    "💡 উদাহরণ:\n<code>Canva Pro | ৯৯ টাকা | ১ বছরের গ্যারান্টিসহ প্রিমিয়াম সাবস্ক্রিপশন</code></blockquote>",
+                    parse_mode=ParseMode.HTML,
+                )
+            elif action == "del_prod":
+                with get_db() as conn:
+                    prods = conn.execute("SELECT * FROM products ORDER BY id ASC").fetchall()
+                await query.answer()
+                if not prods:
+                    await query.message.reply_text("⚠️ শপে বর্তমানে কোনো পণ্য নেই।")
+                    return
+                btns = []
+                for p in prods:
+                    btns.append([InlineKeyboardButton(f"🗑️ #{p['id']} {p['name']} ({p['price']})", callback_data=f"admin_delp:{p['id']}")])
+                await query.message.reply_text(
+                    f"🗑️ <b>পণ্য ডিলিট করতে নিচের তালিকা থেকে সিলেক্ট করুন:</b>",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup(btns),
+                )
+            elif action == "ban_user":
+                context.user_data["state"] = "ADMIN_BAN_UNBAN"
+                await query.answer()
+                await query.message.reply_text(
+                    f"🚫 <b>ইউজার Ban / Unban করুন</b>\n"
+                    f"{DIVIDER}\n"
+                    "<blockquote>যেকোনো ইউজারকে ব্যান বা আনব্যান করতে তার <b>Telegram User ID</b> লিখে পাঠান (ব্যান থাকলে আনব্যান হবে, আর আনব্যান থাকলে ব্যান হবে):</blockquote>",
+                    parse_mode=ParseMode.HTML,
+                )
+            elif action == "add_pts":
+                context.user_data["state"] = "ADMIN_GIFT_POINTS"
+                await query.answer()
+                await query.message.reply_text(
+                    f"🎁 <b>ইউজারকে পয়েন্ট গিফট করুন</b>\n"
+                    f"{DIVIDER}\n"
+                    "<blockquote>নিচের ফরম্যাটে ইউজার আইডি ও পয়েন্ট লিখে পাঠান:\n"
+                    "<code>User_ID Points</code>\n\n"
+                    "💡 উদাহরণ: <code>123456789 100</code></blockquote>",
+                    parse_mode=ParseMode.HTML,
+                )
+            elif action == "orders":
+                with get_db() as conn:
+                    orders = conn.execute("SELECT * FROM orders ORDER BY id DESC LIMIT 10").fetchall()
+                await query.answer()
+                if not orders:
+                    await query.message.reply_text("📦 এখনো কোনো অর্ডার জমা পড়েনি।")
+                    return
+                lines = [f"📦 <b>সর্বশেষ ১০টি অর্ডার তালিকা</b>\n{DIVIDER}"]
+                for o in orders:
+                    lines.append(
+                        f"<blockquote>🛒 <b>Order #{o['id']}</b> — {html.escape(o['product_name'])}\n"
+                        f"👤 User ID: <code>{o['user_id']}</code>\n"
+                        f"📝 বিবরণ: {html.escape(o['customer_details'])}</blockquote>"
+                    )
+                await query.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+            return
+
+        if data.startswith("admin_delp:"):
+            if not is_admin(user.id):
+                await query.answer()
+                return
+            pid = int(data.split(":", 1)[1])
+            with get_db() as conn:
+                conn.execute("DELETE FROM products WHERE id = ?", (pid,))
+                conn.commit()
+            await query.answer("✅ পণ্য ডিলিট করা হয়েছে!", show_alert=True)
+            await query.message.edit_text(f"🗑️ প্রোডাক্ট ID #{pid} সফলভাবে ডিলিট করা হয়েছে।")
             return
 
         # Check maintenance & force join for normal users
@@ -2067,7 +2342,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 parse_mode=ParseMode.HTML,
             )
             quiz_state["index"] += 1
-            await send_quiz_question(query.message, context)
+            await send_quiz_question(query.message, context, user.id)
             return
 
         # 8. Shop Buy Button
@@ -2144,66 +2419,161 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             return
 
     text = (msg.text or "").strip()
+    matched_btn = match_menu_button(text)
 
     # 3. Handle "🏠 মেনু" reset button at any time
-    if text == BTN_MENU:
+    if matched_btn == BTN_MENU:
         context.user_data["state"] = None
         context.user_data.pop("pdf_images", None)
         context.user_data.pop("quiz", None)
         await msg.reply_text(
             f"🏠 <b>মূল মেনুতে ফিরে এসেছেন</b>\n{DIVIDER}\n👇 নিচের বাটন থেকে আপনার পছন্দের যেকোনো অপশন বেছে নিন:",
             parse_mode=ParseMode.HTML,
-            reply_markup=MAIN_MENU_MARKUP,
+            reply_markup=get_main_menu_markup(user.id),
         )
         return
 
-    # 4. Handle Admin Broadcast State
+    # 4. Handle "✅ PDF বানান" button
+    if matched_btn == BTN_MAKE_PDF_DONE:
+        await finalize_images_to_pdf(msg, user.id, context)
+        return
+
+    # 5. If user tapped any main menu button, switch mode & prompt immediately
+    if matched_btn:
+        if is_maintenance_on() and not is_admin(user.id):
+            await msg.reply_text(
+                "🔧 বট বর্তমানে রক্ষণাবেক্ষণ (Maintenance) কাজের জন্য সাময়িকভাবে বন্ধ আছে। অনুগ্রহ করে কিছুক্ষণ পর আবার চেষ্টা করুন 🙏"
+            )
+            return
+        if not await check_force_join(update, context):
+            return
+        await route_menu_button(matched_btn, msg, user, context)
+        return
+
+    # 6. Handle Admin Interactive States
     state = context.user_data.get("state")
-    if state == "ADMIN_BROADCAST" and is_admin(user.id):
-        context.user_data["state"] = None
-        with get_db() as conn:
-            all_users = conn.execute("SELECT user_id FROM users WHERE banned = 0").fetchall()
-        sent = 0
-        failed = 0
-        status_msg = await msg.reply_text("📢 ব্রডকাস্ট পাঠানো হচ্ছে...")
-        for r in all_users:
-            uid = r["user_id"]
-            try:
-                await msg.copy(chat_id=uid)
-                sent += 1
-                await asyncio.sleep(0.04)
-            except Exception:
-                failed += 1
-        await status_msg.edit_text(
-            f"✅ <b>ব্রডকাস্ট সম্পন্ন!</b>\n"
-            f"{DIVIDER}\n"
-            f"<blockquote>• সফল: <b>{sent} জন</b>\n• ব্যর্থ: <b>{failed} জন</b></blockquote>",
-            parse_mode=ParseMode.HTML,
-        )
-        return
+    if is_admin(user.id) and state and state.startswith("ADMIN_"):
+        if state == "ADMIN_BROADCAST":
+            context.user_data["state"] = None
+            with get_db() as conn:
+                all_users = conn.execute("SELECT user_id FROM users WHERE banned = 0").fetchall()
+            sent = 0
+            failed = 0
+            status_msg = await msg.reply_text("📢 ব্রডকাস্ট পাঠানো হচ্ছে...")
+            for r in all_users:
+                uid = r["user_id"]
+                try:
+                    await msg.copy(chat_id=uid)
+                    sent += 1
+                    await asyncio.sleep(0.04)
+                except Exception:
+                    failed += 1
+            await status_msg.edit_text(
+                f"✅ <b>ব্রডকাস্ট সম্পন্ন!</b>\n"
+                f"{DIVIDER}\n"
+                f"<blockquote>• সফল: <b>{sent} জন</b>\n• ব্যর্থ: <b>{failed} জন</b></blockquote>",
+                parse_mode=ParseMode.HTML,
+            )
+            return
 
-    # 5. Check Maintenance Mode for non-admins
+        if state == "ADMIN_SET_CHANNEL":
+            context.user_data["state"] = None
+            arg = text.strip()
+            if arg.lower() in ("off", "none"):
+                set_setting("force_join", "off")
+                await msg.reply_text("✅ Force Join চ্যানেল বন্ধ (OFF) করা হয়েছে।", reply_markup=get_main_menu_markup(user.id))
+            else:
+                if not arg.startswith("@") and not arg.startswith("-100"):
+                    arg = f"@{arg}"
+                set_setting("force_join", arg)
+                await msg.reply_text(
+                    f"✅ Force Join চ্যানেল সেট করা হয়েছে: <b>{html.escape(arg)}</b>",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=get_main_menu_markup(user.id),
+                )
+            return
+
+        if state == "ADMIN_ADD_PRODUCT":
+            parts = [p.strip() for p in text.split("|")]
+            if len(parts) < 3 or not all(parts[:3]):
+                await msg.reply_text(
+                    "⚠️ <b>সঠিক ফরম্যাটে লিখুন:</b>\n<code>পণ্য নাম | দাম | বিবরণ</code>",
+                    parse_mode=ParseMode.HTML,
+                )
+                return
+            context.user_data["state"] = None
+            name, price, desc = parts[0], parts[1], parts[2]
+            with get_db() as conn:
+                cur = conn.cursor()
+                cur.execute("INSERT INTO products (name, price, description) VALUES (?, ?, ?)", (name, price, desc))
+                pid = cur.lastrowid
+                conn.commit()
+            await msg.reply_text(
+                f"✅ <b>পণ্য সফলভাবে যোগ করা হয়েছে!</b>\n"
+                f"{DIVIDER}\n"
+                f"<blockquote>🆔 ID: <b>#{pid}</b>\n📦 নাম: {html.escape(name)}\n💰 দাম: {html.escape(price)}</blockquote>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=get_main_menu_markup(user.id),
+            )
+            return
+
+        if state == "ADMIN_BAN_UNBAN":
+            target = bn_to_en_digits(text.strip())
+            if not target.isdigit():
+                await msg.reply_text("⚠️ অনুগ্রহ করে সঠিক সংখ্যার User ID পাঠান।")
+                return
+            context.user_data["state"] = None
+            uid = int(target)
+            ensure_user(uid, "User")
+            u_row = get_user(uid)
+            new_ban = 0 if (u_row and u_row["banned"] == 1) else 1
+            with get_db() as conn:
+                conn.execute("UPDATE users SET banned = ? WHERE user_id = ?", (new_ban, uid))
+                conn.commit()
+            status_str = "🚫 ব্যান (Banned)" if new_ban == 1 else "✅ আনব্যান (Unbanned)"
+            await msg.reply_text(
+                f"ইউজার <code>{uid}</code>-কে <b>{status_str}</b> করা হয়েছে।",
+                parse_mode=ParseMode.HTML,
+                reply_markup=get_main_menu_markup(user.id),
+            )
+            return
+
+        if state == "ADMIN_GIFT_POINTS":
+            nums = re.findall(r"-?\d+", bn_to_en_digits(text))
+            if len(nums) < 2:
+                await msg.reply_text("⚠️ সঠিক ফরম্যাটে লিখুন: <code>User_ID Points</code>", parse_mode=ParseMode.HTML)
+                return
+            context.user_data["state"] = None
+            uid = int(nums[0])
+            pts = int(nums[1])
+            ensure_user(uid, "User")
+            add_points(uid, pts)
+            await msg.reply_text(
+                f"🎁 ইউজার <code>{uid}</code>-কে <b>{pts:+} পয়েন্ট</b> দেওয়া হয়েছে!",
+                parse_mode=ParseMode.HTML,
+                reply_markup=get_main_menu_markup(user.id),
+            )
+            try:
+                await context.bot.send_message(
+                    chat_id=uid,
+                    text=f"🎁 <b>অভিনন্দন!</b> অ্যাডমিন আপনাকে <b>{pts:+} পয়েন্ট</b> উপহার দিয়েছেন!",
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception:
+                pass
+            return
+
+    # 7. Check Maintenance Mode & Force Join for non-admins
     if is_maintenance_on() and not is_admin(user.id):
         await msg.reply_text(
             "🔧 বট বর্তমানে রক্ষণাবেক্ষণ (Maintenance) কাজের জন্য সাময়িকভাবে বন্ধ আছে। অনুগ্রহ করে কিছুক্ষণ পর আবার চেষ্টা করুন 🙏"
         )
         return
 
-    # 6. Check Force Join before using tools
     if not await check_force_join(update, context):
         return
 
-    # 7. Check if user pressed "✅ PDF বানান"
-    if text == BTN_MAKE_PDF_DONE:
-        await finalize_images_to_pdf(msg, user.id, context)
-        return
-
-    # 8. If user tapped any main menu button, switch mode & prompt
-    if text in ALL_MENU_BUTTONS:
-        await route_menu_button(text, msg, user, context)
-        return
-
-    # 9. Handle incoming Voice, Photo, Document, or Text according to current state
+    # 8. Handle incoming Voice, Photo, Document, or Text according to current state
     try:
         if msg.voice or msg.audio:
             await process_voice_message(msg, user.id, context)
@@ -2219,11 +2589,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             return
     except Exception as e:
         logger.error(f"Error handling user input in state {state}: {e}", exc_info=True)
-        await msg.reply_text(ERROR_MSG_BN, reply_markup=MAIN_MENU_MARKUP)
+        await msg.reply_text(ERROR_MSG_BN, reply_markup=get_main_menu_markup(user.id))
 
 
 # ---------------------------------------------------------------------------
-# MENU BUTTON ROUTER (STYLISH PROMPTS)
+# MENU BUTTON ROUTER (STYLISH PROMPTS + NEW TOOLS + ADMIN PANEL)
 # ---------------------------------------------------------------------------
 async def route_menu_button(
     btn: str, msg, user, context: ContextTypes.DEFAULT_TYPE
@@ -2231,6 +2601,13 @@ async def route_menu_button(
     context.user_data["state"] = None
 
     try:
+        if btn == BTN_ADMIN_PANEL:
+            if is_admin(user.id):
+                await send_admin_panel(msg, user.id)
+            else:
+                await msg.reply_text("🔒 এই প্যানেলটি শুধুমাত্র বট অ্যাডমিনের জন্য সংরক্ষিত।")
+            return
+
         if btn == BTN_AI_CHAT:
             context.user_data["state"] = "WAIT_AI_CHAT"
             await msg.reply_text(
@@ -2296,7 +2673,7 @@ async def route_menu_button(
             await msg.reply_text(
                 f"📥 <b>অল-ইন-ওয়ান ভিডিও ডাউনলোডার</b>\n"
                 f"{DIVIDER}\n"
-                "<blockquote>TikTok (ওয়াটারমার্ক ছাড়া HD), YouTube, Facebook বা Instagram ভিডিওর লিংক (অথবা শেয়ার টেক্সট) পাঠান:</blockquote>",
+                "<blockquote>🎬 <b>TikTok, YouTube, Facebook বা Instagram</b>-এর যেকোনো পাবলিক ভিডিওর লিংক (অথবা শেয়ার টেক্সট) পাঠান:</blockquote>",
                 parse_mode=ParseMode.HTML,
             )
 
@@ -2591,7 +2968,63 @@ async def route_menu_button(
                 "earned_points": 0,
             }
             await status_msg.delete()
-            await send_quiz_question(msg, context)
+            await send_quiz_question(msg, context, user.id)
+
+        # --- 6 NEW HIGH-UTILITY BUTTONS ---
+        elif btn == BTN_GRAMMAR:
+            context.user_data["state"] = "WAIT_GRAMMAR"
+            await msg.reply_text(
+                f"📝 <b>বানান ও Grammar সংশোধক</b>\n"
+                f"{DIVIDER}\n"
+                "<blockquote>আপনার যেকোনো ইংরেজি বা বাংলা বাক্য পাঠান। বট সেটির বানান ও ব্যাকরণগত ভুল ঠিক করে প্রফেশনালভাবে সাজিয়ে দেবে!</blockquote>",
+                parse_mode=ParseMode.HTML,
+            )
+
+        elif btn == BTN_EMAIL_CV:
+            context.user_data["state"] = "WAIT_EMAIL_CV"
+            await msg.reply_text(
+                f"📧 <b>ইমেইল, দরখাস্ত ও CV রাইটার</b>\n"
+                f"{DIVIDER}\n"
+                "<blockquote>আপনি কী বিষয়ে ইমেইল, ছুটির দরখাস্ত বা চাকরির কভার লেটার লিখতে চান তা সংক্ষেপে বলুন:\n"
+                "💡 যেমন: <code>অসুস্থতার জন্য ৩ দিনের ছুটির আবেদন</code> অথবা <code>Job application email for Web Developer</code></blockquote>",
+                parse_mode=ParseMode.HTML,
+            )
+
+        elif btn == BTN_CODE_HELP:
+            context.user_data["state"] = "WAIT_CODE_HELP"
+            await msg.reply_text(
+                f"💻 <b>কোড জেনারেটর ও ডিবাগার</b>\n"
+                f"{DIVIDER}\n"
+                "<blockquote>যেকোনো প্রোগ্রামিং ভাষায় (Python, JS, C++, HTML) কোড লিখতে বা এরর ঠিক করতে আপনার সমস্যাটি লিখুন:</blockquote>",
+                parse_mode=ParseMode.HTML,
+            )
+
+        elif btn == BTN_BIO_GEN:
+            context.user_data["state"] = "WAIT_BIO_GEN"
+            await msg.reply_text(
+                f"🪪 <b>স্টাইলিশ প্রোফাইল বায়ো মেকার</b>\n"
+                f"{DIVIDER}\n"
+                "<blockquote>আপনার নাম বা পেশা/শখ লিখে পাঠান (যেমন: <code>Tonmoy, Student & Tech Lover</code>)। বট আপনার Facebook, Instagram ও Telegram-এর জন্য ৫টি ভিআইপি বায়ো তৈরি করে দেবে!</blockquote>",
+                parse_mode=ParseMode.HTML,
+            )
+
+        elif btn == BTN_DREAM_ISLAM:
+            context.user_data["state"] = "WAIT_DREAM_ISLAM"
+            await msg.reply_text(
+                f"🌙 <b>স্বপ্ন ও ইসলামিক প্রশ্নোত্তর</b>\n"
+                f"{DIVIDER}\n"
+                "<blockquote>কুরআন ও সহীহ হাদিসের আলোকে যেকোনো ইসলামিক মাসআলা, দোয়া বা স্বপ্নের তাবীর সম্পর্কে আপনার প্রশ্নটি লিখুন:</blockquote>",
+                parse_mode=ParseMode.HTML,
+            )
+
+        elif btn == BTN_MATH_SOLVE:
+            context.user_data["state"] = "WAIT_MATH_SOLVE"
+            await msg.reply_text(
+                f"🧮 <b>অংক ও বিজ্ঞান সমাধানকারী</b>\n"
+                f"{DIVIDER}\n"
+                "<blockquote>আপনার গণিত, পদার্থবিজ্ঞান বা রসায়নের যেকোনো অংক বা প্রশ্ন লিখে পাঠান—ধাপে ধাপে সহজ বাংলায় সমাধান পেয়ে যাবেন!</blockquote>",
+                parse_mode=ParseMode.HTML,
+            )
 
         elif btn == BTN_SHOP:
             with get_db() as conn:
@@ -2761,7 +3194,7 @@ async def route_menu_button(
 
     except Exception as e:
         logger.error(f"Error in route_menu_button ({btn}): {e}", exc_info=True)
-        await msg.reply_text(ERROR_MSG_BN, reply_markup=MAIN_MENU_MARKUP)
+        await msg.reply_text(ERROR_MSG_BN, reply_markup=get_main_menu_markup(user.id))
 
 
 # ---------------------------------------------------------------------------
@@ -2860,7 +3293,7 @@ async def finalize_images_to_pdf(msg, user_id: int, context: ContextTypes.DEFAUL
                 im = Image.open(p).convert("RGB")
                 pil_images.append(im)
         if not pil_images:
-            await msg.reply_text("⚠️ ছবি প্রসেস করা যায়নি। আবার চেষ্টা করুন।", reply_markup=MAIN_MENU_MARKUP)
+            await msg.reply_text("⚠️ ছবি প্রসেস করা যায়নি। আবার চেষ্টা করুন।", reply_markup=get_main_menu_markup(user_id))
             return
 
         first_img, rest_imgs = pil_images[0], pil_images[1:]
@@ -2874,16 +3307,16 @@ async def finalize_images_to_pdf(msg, user_id: int, context: ContextTypes.DEFAUL
                 document=f,
                 filename="images.pdf",
                 caption=(
-                    f"📄 <b> আপনার PDF প্রস্তুত!</b>\n"
+                    f"📄 <b>আপনার PDF প্রস্তুত!</b>\n"
                     f"{DIVIDER}\n"
                     f"<blockquote>✅ মোট <b>{len(pil_images)}টি</b> ছবি দিয়ে সুন্দরভাবে PDF তৈরি করা হয়েছে।</blockquote>"
                 ),
                 parse_mode=ParseMode.HTML,
-                reply_markup=MAIN_MENU_MARKUP,
+                reply_markup=get_main_menu_markup(user_id),
             )
     except Exception as e:
         logger.error(f"PDF creation failed: {e}", exc_info=True)
-        await msg.reply_text(ERROR_MSG_BN, reply_markup=MAIN_MENU_MARKUP)
+        await msg.reply_text(ERROR_MSG_BN, reply_markup=get_main_menu_markup(user_id))
     finally:
         for im in pil_images:
             try:
@@ -3030,8 +3463,6 @@ async def process_state_text(text: str, msg, user, context: ContextTypes.DEFAULT
     if state == "WAIT_AI_IMG":
         status_msg = await msg.reply_text("🎨 <b>আপনার HD AI ছবি তৈরি হচ্ছে, অনুগ্রহ করে কিছুক্ষণ অপেক্ষা করুন...</b>", parse_mode=ParseMode.HTML)
         encoded_prompt = urllib.parse.quote(text)
-        # Request with nologo=true&nofeed=true&enhance=true, then pass through remove_bottom_watermark_and_polish()
-        # so even if Pollinations burns a bottom logo, it is 100% cropped out and upscaled cleanly to 1024x1024!
         url1 = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1024&height=1024&nologo=true&nofeed=true&enhance=true"
         url2 = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1024&height=1024&nologo=true&seed=42"
 
@@ -3099,7 +3530,11 @@ async def process_state_text(text: str, msg, user, context: ContextTypes.DEFAULT
                 await status_msg.edit_text(ERROR_MSG_BN)
         except Exception as e:
             logger.error(f"Video download failed: {e}", exc_info=True)
-            await status_msg.edit_text("⚠️ ভিডিওটি ডাউনলোড করা যায়নি। লিংকটি সঠিক ও পাবলিক কি না যাচাই করুন 🙏")
+            await status_msg.edit_text(
+                "⚠️ <b>ভিডিওটি ডাউনলোড করা যায়নি।</b>\n"
+                "<blockquote>অনুগ্রহ করে নিশ্চিত করুন ভিডিওটি পাবলিক (Public) আছে এবং প্রাইভেট বা লগইন-লক করা নয় 🙏</blockquote>",
+                parse_mode=ParseMode.HTML,
+            )
         finally:
             if vid_path and os.path.exists(vid_path):
                 try:
@@ -3391,6 +3826,139 @@ async def process_state_text(text: str, msg, user, context: ContextTypes.DEFAULT
             await msg.reply_text("⚠️ জব কিউ (Job Queue) সক্রিয় নেই।")
         return
 
+    # --- 6 NEW HIGH-UTILITY STATES ---
+    if state == "WAIT_GRAMMAR":
+        await context.bot.send_chat_action(chat_id=msg.chat_id, action=ChatAction.TYPING)
+        out = await asyncio.to_thread(
+            call_groq_chat,
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are an expert English and Bangla grammar corrector. "
+                        "Provide: 1) The corrected version, 2) A brief explanation in Bangla of what was fixed, and 3) A more natural/professional alternative. Do not use raw markdown asterisks (**)."
+                    ),
+                },
+                {"role": "user", "content": text},
+            ],
+        )
+        add_points(user.id, 1)
+        await msg.reply_text(
+            f"📝 <b>বানান ও Grammar সংশোধন ফলাফল</b>\n{DIVIDER}\n<blockquote>{html.escape(out)}</blockquote>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if state == "WAIT_EMAIL_CV":
+        await context.bot.send_chat_action(chat_id=msg.chat_id, action=ChatAction.TYPING)
+        out = await asyncio.to_thread(
+            call_groq_chat,
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are an expert professional writer. Write a clean, ready-to-send formal Email, Application (দরখাস্ত), or CV Cover Letter "
+                        "based on the user's request in the appropriate language (Bangla or English). Do not use raw markdown asterisks (**)."
+                    ),
+                },
+                {"role": "user", "content": text},
+            ],
+        )
+        add_points(user.id, 1)
+        await msg.reply_text(
+            f"📧 <b>আপনার প্রফেশনাল ইমেইল / আবেদনপত্র</b>\n{DIVIDER}\n<blockquote>{html.escape(out)}</blockquote>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if state == "WAIT_CODE_HELP":
+        await context.bot.send_chat_action(chat_id=msg.chat_id, action=ChatAction.TYPING)
+        out = await asyncio.to_thread(
+            call_groq_chat,
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a senior software engineer. Write clean, working code and explain how it works in simple Bangla. "
+                        "Do not use raw markdown asterisks (**)."
+                    ),
+                },
+                {"role": "user", "content": text},
+            ],
+        )
+        add_points(user.id, 1)
+        await msg.reply_text(
+            f"💻 <b>কোড জেনারেটর ও সমাধান</b>\n{DIVIDER}\n<pre>{html.escape(out[:3800])}</pre>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if state == "WAIT_BIO_GEN":
+        await context.bot.send_chat_action(chat_id=msg.chat_id, action=ChatAction.TYPING)
+        out = await asyncio.to_thread(
+            call_groq_chat,
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "Generate 5 ultra-stylish, VIP social media profile bios (mix of Bangla and English with aesthetic emojis & symbols) "
+                        "for Facebook, Instagram, and Telegram based on the user's input. Do not use raw markdown asterisks (**)."
+                    ),
+                },
+                {"role": "user", "content": text},
+            ],
+        )
+        add_points(user.id, 1)
+        await msg.reply_text(
+            f"🪪 <b>আপনার স্টাইলিশ ভিআইপি বায়ো</b>\n{DIVIDER}\n<blockquote>{html.escape(out)}</blockquote>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if state == "WAIT_DREAM_ISLAM":
+        await context.bot.send_chat_action(chat_id=msg.chat_id, action=ChatAction.TYPING)
+        out = await asyncio.to_thread(
+            call_groq_chat,
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a knowledgeable, respectful Islamic scholar assistant. Answer Islamic questions or dream interpretations "
+                        "in polite Bangla based on Quran, Sahih Hadith, and classical Islamic scholarship. Do not use raw markdown asterisks (**)."
+                    ),
+                },
+                {"role": "user", "content": text},
+            ],
+        )
+        add_points(user.id, 1)
+        await msg.reply_text(
+            f"🌙 <b>ইসলামিক ও স্বপ্ন বিষয়ক উত্তর</b>\n{DIVIDER}\n<blockquote>{html.escape(out)}</blockquote>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if state == "WAIT_MATH_SOLVE":
+        await context.bot.send_chat_action(chat_id=msg.chat_id, action=ChatAction.TYPING)
+        out = await asyncio.to_thread(
+            call_groq_chat,
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a friendly math and science teacher. Solve the given math or science problem step-by-step in clear Bangla. "
+                        "Do not use raw markdown asterisks (**)."
+                    ),
+                },
+                {"role": "user", "content": text},
+            ],
+        )
+        add_points(user.id, 1)
+        await msg.reply_text(
+            f"🧮 <b>অংক ও বিজ্ঞান সমাধান</b>\n{DIVIDER}\n<blockquote>{html.escape(out)}</blockquote>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
     if state == "WAIT_ORDER_DETAILS":
         prod = context.user_data.get("buy_product")
         if not prod:
@@ -3428,7 +3996,7 @@ async def process_state_text(text: str, msg, user, context: ContextTypes.DEFAULT
             f"{DIVIDER}\n"
             f"<blockquote>খুব শীঘ্রই আমাদের প্রতিনিধি আপনার সাথে যোগাযোগ করবেন। আমাদের সাথে থাকার জন্য ধন্যবাদ 🙏</blockquote>",
             parse_mode=ParseMode.HTML,
-            reply_markup=MAIN_MENU_MARKUP,
+            reply_markup=get_main_menu_markup(user.id),
         )
         return
 
@@ -3467,10 +4035,10 @@ async def process_state_text(text: str, msg, user, context: ContextTypes.DEFAULT
                 f"✅ <b>মেসেজ পাঠানো হয়েছে!</b>\n{DIVIDER}\n"
                 "<blockquote>আপনার মেসেজটি অ্যাডমিনের কাছে পৌঁছেছে। অ্যাডমিন উত্তর দিলে এখানেই দেখতে পাবেন 🙏</blockquote>",
                 parse_mode=ParseMode.HTML,
-                reply_markup=MAIN_MENU_MARKUP,
+                reply_markup=get_main_menu_markup(user.id),
             )
         else:
-            await msg.reply_text(ERROR_MSG_BN, reply_markup=MAIN_MENU_MARKUP)
+            await msg.reply_text(ERROR_MSG_BN, reply_markup=get_main_menu_markup(user.id))
         return
 
 
@@ -3505,8 +4073,7 @@ def main() -> None:
         flask_thread.join()
         return
 
-    # Python 3.14+ removed implicit event loop creation in asyncio.get_event_loop().
-    # Explicitly create and set an event loop on the main thread before building/running Application.
+    # Python 3.14+ explicit event loop setup
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
