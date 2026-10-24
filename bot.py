@@ -218,8 +218,32 @@ def normalize_btn_text(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# PERSISTENT MENU KEYBOARD (PREMIUM LOOK + EXTRA USEFUL TOOLS + ADMIN PANEL)
+# PERSISTENT MENU KEYBOARD (COLORFUL BUTTONS + COMPACT NON-TRUNCATING LABELS)
 # ---------------------------------------------------------------------------
+def styled_kb_btn(text: str, style: Optional[str] = None, **kwargs) -> KeyboardButton:
+    """Create a Telegram KeyboardButton with Bot API 9.4+ background color style ('primary', 'success', 'danger')."""
+    if not style:
+        return KeyboardButton(text, **kwargs)
+    try:
+        return KeyboardButton(text, style=style, **kwargs)
+    except TypeError:
+        api_kw = dict(kwargs.pop("api_kwargs", None) or {})
+        api_kw["style"] = style
+        return KeyboardButton(text, api_kwargs=api_kw, **kwargs)
+
+
+def styled_inline_btn(text: str, style: Optional[str] = None, **kwargs) -> InlineKeyboardButton:
+    """Create a Telegram InlineKeyboardButton with Bot API 9.4+ background color style ('primary', 'success', 'danger')."""
+    if not style:
+        return InlineKeyboardButton(text, **kwargs)
+    try:
+        return InlineKeyboardButton(text, style=style, **kwargs)
+    except TypeError:
+        api_kw = dict(kwargs.pop("api_kwargs", None) or {})
+        api_kw["style"] = style
+        return InlineKeyboardButton(text, api_kwargs=api_kw, **kwargs)
+
+
 BTN_AI_CHAT = "🤖 AI চ্যাট"
 BTN_TTS = "🎙️ Voice বানান"
 BTN_STT = "🎤 Voice → Text"
@@ -233,7 +257,7 @@ BTN_PDF_SUM = "📄 PDF Summary"
 BTN_PRAYER = "🕐 নামাজের সময়"
 BTN_WEATHER = "🌦️ আবহাওয়া"
 BTN_CURRENCY = "💱 কারেন্সি"
-BTN_SHORTURL = "🔗 লিংক ছোট করুন"
+BTN_SHORTURL = "🔗 লিংক ছোট"
 BTN_DICT = "📚 ডিকশনারি"
 BTN_JOKES = "😂 জোকস"
 BTN_BMI = "⚖️ BMI হিসাব"
@@ -243,25 +267,25 @@ BTN_CRYPTO = "🪙 ক্রিপ্টো দাম"
 BTN_AGE = "🎂 বয়স হিসাব"
 BTN_UNIT = "🔄 ইউনিট কনভার্ট"
 BTN_FANCY = "✨ ফ্যান্সি টেক্সট"
-BTN_LOVE = "❤️ Love ক্যালকুলেটর"
+BTN_LOVE = "❤️ Love হিসাব"
 BTN_COMPRESS = "🗜️ ছবি কমপ্রেস"
 BTN_LYRICS = "🎵 গানের লিরিক্স"
 BTN_PASSWORD = "🔐 পাসওয়ার্ড"
 BTN_DUA = "🤲 আজকের দোয়া"
 BTN_REMINDER = "⏰ রিমাইন্ডার"
 BTN_QUIZ = "🧠 কুইজ খেলুন"
-# 6 New High-Utility Tools
-BTN_GRAMMAR = "📝 বানান ও Grammar"
-BTN_EMAIL_CV = "📧 ইমেইল / আবেদনপত্র"
+# High-Utility Tools (Compact labels so they never truncate on mobile/desktop)
+BTN_GRAMMAR = "📝 বানান শুদ্ধি"
+BTN_EMAIL_CV = "📧 ইমেইল ও CV"
 BTN_CODE_HELP = "💻 কোড জেনারেটর"
 BTN_BIO_GEN = "🪪 স্টাইলিশ বায়ো"
-BTN_DREAM_ISLAM = "🌙 স্বপ্ন ও ইসলামিক প্রশ্ন"
-BTN_MATH_SOLVE = "🧮 অংক ও বিজ্ঞান সমাধান"
-BTN_BLOOD_INFO = "🩸 রক্তের গ্রুপ গাইড"
-BTN_DIET_PLAN = "🥗 ডায়েট ও স্বাস্থ্য চার্ট"
+BTN_DREAM_ISLAM = "🌙 ইসলামিক প্রশ্ন"
+BTN_MATH_SOLVE = "🧮 অংক সমাধান"
+BTN_BLOOD_INFO = "🩸 রক্তের গ্রুপ"
+BTN_DIET_PLAN = "🥗 ডায়েট চার্ট"
 BTN_BIZ_IDEA = "💼 বিজনেস আইডিয়া"
-BTN_MOVIE_REC = "🎬 মুভি রিকমেন্ডেশন"
-# Shop, Engagement & System Buttons
+BTN_MOVIE_REC = "🎬 সেরা মুভি"
+# Engagement & System Buttons
 BTN_SHOP = "🛍️ শপ"
 BTN_CONTACT = "📩 Contact Admin"
 BTN_PROFILE = "👤 প্রোফাইল"
@@ -271,15 +295,15 @@ BTN_SPIN = "🎰 স্পিন"
 BTN_REFER = "👥 রেফার করুন"
 BTN_ABOUT = "ℹ️ About"
 BTN_HELP = "❓ Help"
-BTN_DEV = "👨💻 Developer"
+BTN_DEV = "👨‍💻 Developer"
 BTN_ADMIN_PANEL = "🛠️ Admin Panel"
 BTN_MENU = "🏠 মেনু"
 BTN_MAKE_PDF_DONE = "✅ PDF বানান"
 
-# Executive Main Menu & Paginated Tools Explorer (Pages 1/7 to 7/7)
-BTN_ALL_TOOLS_VIEW = "✨ ফ্রি AI ও স্মার্ট টুলস ভান্ডার (৪০+ টুলস) 💠"
-BTN_TOOLS_NEXT = "পরের পেজ ⏩ 🟢"
-BTN_TOOLS_BACK = "🟠 ⏪ আগের পেজ"
+# Main Menu & Paginated Tools Explorer (Pages 1/7 to 7/7)
+BTN_ALL_TOOLS_VIEW = "🧰 All Tools"
+BTN_TOOLS_NEXT = "➡️ Next"
+BTN_TOOLS_BACK = "⬅️ Back"
 BTN_TOOLS_PAGE_INFO = "💠 পেজ তালিকা"
 BTN_WEBAPP_OPEN = "🌐 আমাদের ওয়েবসাইট খুলুন (Mini App)"
 
@@ -291,98 +315,89 @@ CAT_CALC_PDF = "🟠 দরকারি টুলস ও PDF"
 CAT_LIFE_FUN = "🟡 লাইফস্টাইল ও বিনোদন"
 CAT_REWARD_SHOP = "🔴 বোনাস, কুইজ ও প্রোফাইল"
 
-# Original Executive Main Menu Layout (All tools including AI Chat, AI Image, Spin & Quiz are inside Tools Pages)
+# Clean, Non-Truncating Main Menu Layout with Colored Button Styles inside each button
 CLEAN_MAIN_MENU_LAYOUT = [
-    [KeyboardButton(BTN_ALL_TOOLS_VIEW)],
-    [KeyboardButton("🔵 👤 আমার প্রোফাইল"), KeyboardButton("🟡 🏆 টপ লিডারবোর্ড")],
-    [KeyboardButton("🟠 🎁 ডেইলি বোনাস"), KeyboardButton("🌸 👥 রেফার ও পয়েন্ট")],
-    [KeyboardButton("🩵 ❓ সাহায্য ও গাইড"), KeyboardButton("💎 📩 অ্যাডমিন সাপোর্ট")],
-    [KeyboardButton("🌟 ℹ️ বট পরিচিতি"), KeyboardButton("👑 👨‍💻 ডেভেলপার তথ্য")],
+    [styled_kb_btn(BTN_ALL_TOOLS_VIEW, "primary")],
+    [styled_kb_btn(BTN_PROFILE, "success"), styled_kb_btn(BTN_LEADERBOARD, "primary")],
+    [styled_kb_btn(BTN_DAILY, "danger"), styled_kb_btn(BTN_REFER, "success")],
+    [styled_kb_btn(BTN_HELP, "primary"), styled_kb_btn(BTN_CONTACT, "danger")],
+    [styled_kb_btn(BTN_ABOUT, "success"), styled_kb_btn(BTN_DEV, "primary")],
 ]
 
-# 7 Themed Pages x 6 Tools Per Page = 42 Colorful Tool Buttons (Spin & Quiz on Page 2!)
+# 7 Pages x 6 Tools Per Page = 42 Tools (Clean short labels + vibrant button styles)
 PAGINATED_TOOLS_PAGES = [
     {
         "page": 1,
-        "title": "🟣 পেজ ১/৭ — ফ্ল্যাগশিপ AI ও ভয়েস স্টুডিও",
-        "dots": "🟣⚪⚪⚪⚪⚪⚪",
         "tools": [
-            ("🟣 " + BTN_AI_CHAT, "🟢 " + BTN_AI_IMG),
-            ("🔵 " + BTN_TTS, "🟠 " + BTN_STT),
-            ("🔴 " + BTN_VID_DL, "🟡 " + BTN_TRANSLATE),
+            (BTN_AI_CHAT, BTN_AI_IMG),
+            (BTN_TTS, BTN_STT),
+            (BTN_VID_DL, BTN_TRANSLATE),
         ],
     },
     {
         "page": 2,
-        "title": "🟢 পেজ ২/৭ — কুইজ, লাকি স্পিন, রাইটিং ও PDF",
-        "dots": "⚪🟢⚪⚪⚪⚪⚪",
         "tools": [
-            ("🟡 " + BTN_QUIZ, "🔴 " + BTN_SPIN),
-            ("🟣 " + BTN_CAPTION, "🟢 " + BTN_STORY),
-            ("🔵 " + BTN_IMG_PDF, "🟠 " + BTN_PDF_SUM),
+            (BTN_QUIZ, BTN_SPIN),
+            (BTN_CAPTION, BTN_STORY),
+            (BTN_IMG_PDF, BTN_PDF_SUM),
         ],
     },
     {
         "page": 3,
-        "title": "🔵 পেজ ৩/৭ — নামাজ, দোয়া, আবহাওয়া ও খবর",
-        "dots": "⚪⚪🔵⚪⚪⚪⚪",
         "tools": [
-            ("🟣 " + BTN_PRAYER, "🟢 " + BTN_DUA),
-            ("🔵 " + BTN_DREAM_ISLAM, "🟠 " + BTN_WEATHER),
-            ("🔴 " + BTN_NEWS, "🟡 " + BTN_REMINDER),
+            (BTN_PRAYER, BTN_DUA),
+            (BTN_DREAM_ISLAM, BTN_WEATHER),
+            (BTN_NEWS, BTN_REMINDER),
         ],
     },
     {
         "page": 4,
-        "title": "🟠 পেজ ৪/৭ — শিক্ষা, কোডিং ও ক্যারিয়ার",
-        "dots": "⚪⚪⚪🟠⚪⚪⚪",
         "tools": [
-            ("🟣 " + BTN_GRAMMAR, "🟢 " + BTN_EMAIL_CV),
-            ("🔵 " + BTN_CODE_HELP, "🟠 " + BTN_MATH_SOLVE),
-            ("🔴 " + BTN_DICT, "🟡 " + BTN_BIZ_IDEA),
+            (BTN_GRAMMAR, BTN_EMAIL_CV),
+            (BTN_CODE_HELP, BTN_MATH_SOLVE),
+            (BTN_DICT, BTN_BIZ_IDEA),
         ],
     },
     {
         "page": 5,
-        "title": "🔴 পেজ ৫/৭ — ফিন্যান্স, ক্যালকুলেটর ও স্মার্ট টুলস",
-        "dots": "⚪⚪⚪⚪🔴⚪⚪",
         "tools": [
-            ("🟣 " + BTN_CURRENCY, "🟢 " + BTN_CRYPTO),
-            ("🔵 " + BTN_AGE, "🟠 " + BTN_UNIT),
-            ("🔴 " + BTN_SHORTURL, "🟡 " + BTN_QR),
+            (BTN_CURRENCY, BTN_CRYPTO),
+            (BTN_AGE, BTN_UNIT),
+            (BTN_SHORTURL, BTN_QR),
         ],
     },
     {
         "page": 6,
-        "title": "🟡 পেজ ৬/৭ — স্বাস্থ্য ও সিকিউরিটি ইউটিলিটি",
-        "dots": "⚪⚪⚪⚪⚪🟡⚪",
         "tools": [
-            ("🟣 " + BTN_BMI, "🟢 " + BTN_BLOOD_INFO),
-            ("🔵 " + BTN_DIET_PLAN, "🟠 " + BTN_COMPRESS),
-            ("🔴 " + BTN_PASSWORD, "🟡 " + BTN_BIO_GEN),
+            (BTN_BMI, BTN_BLOOD_INFO),
+            (BTN_DIET_PLAN, BTN_COMPRESS),
+            (BTN_PASSWORD, BTN_BIO_GEN),
         ],
     },
     {
         "page": 7,
-        "title": "🌸 পেজ ৭/৭ — বিনোদন, লিরিক্স ও বোনাস",
-        "dots": "⚪⚪⚪⚪⚪⚪🌸",
         "tools": [
-            ("🟣 " + BTN_FANCY, "🟢 " + BTN_LOVE),
-            ("🔵 " + BTN_LYRICS, "🟠 " + BTN_MOVIE_REC),
-            ("🔴 " + BTN_JOKES, "🟡 " + BTN_DAILY),
+            (BTN_FANCY, BTN_LOVE),
+            (BTN_LYRICS, BTN_MOVIE_REC),
+            (BTN_JOKES, BTN_DAILY),
         ],
     },
 ]
 
 TOTAL_TOOL_PAGES = len(PAGINATED_TOOLS_PAGES)
 
+# Row color styles for the 3 tool rows on each page
+TOOL_ROW_STYLES = [
+    ("primary", "success"),
+    ("success", "primary"),
+    ("danger", "primary"),
+]
+
 
 def get_main_menu_markup(user_id: Optional[int] = None) -> ReplyKeyboardMarkup:
     rows = [list(r) for r in CLEAN_MAIN_MENU_LAYOUT]
-    if WEBAPP_URL and WEBAPP_URL.startswith("https://"):
-        rows.insert(0, [KeyboardButton(BTN_WEBAPP_OPEN, web_app=WebAppInfo(url=WEBAPP_URL))])
     if user_id and is_admin(user_id):
-        rows.append([KeyboardButton(BTN_ADMIN_PANEL)])
+        rows.append([styled_kb_btn(BTN_ADMIN_PANEL, "danger")])
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
 
@@ -390,20 +405,32 @@ def get_paginated_tools_markup(page: int = 1, user_id: Optional[int] = None) -> 
     page = max(1, min(TOTAL_TOOL_PAGES, page))
     page_data = PAGINATED_TOOLS_PAGES[page - 1]
     rows: List[List[KeyboardButton]] = []
-    for left_btn, right_btn in page_data["tools"]:
-        rows.append([KeyboardButton(left_btn), KeyboardButton(right_btn)])
+    for idx, (left_btn, right_btn) in enumerate(page_data["tools"]):
+        left_style, right_style = TOOL_ROW_STYLES[idx % len(TOOL_ROW_STYLES)]
+        rows.append([
+            styled_kb_btn(left_btn, left_style),
+            styled_kb_btn(right_btn, right_style),
+        ])
 
-    bn_page = en_to_bn_digits(str(page))
-    bn_total = en_to_bn_digits(str(TOTAL_TOOL_PAGES))
-    page_badge = f"💠 পেজ {bn_page}/{bn_total}"
+    page_badge = f"📄 {page}/{TOTAL_TOOL_PAGES}"
     if page <= 1:
-        rows.append([KeyboardButton(page_badge), KeyboardButton(BTN_TOOLS_NEXT)])
+        rows.append([
+            styled_kb_btn(page_badge),
+            styled_kb_btn(BTN_TOOLS_NEXT, "success"),
+        ])
     elif page >= TOTAL_TOOL_PAGES:
-        rows.append([KeyboardButton(BTN_TOOLS_BACK), KeyboardButton(page_badge)])
+        rows.append([
+            styled_kb_btn(BTN_TOOLS_BACK, "danger"),
+            styled_kb_btn(page_badge),
+        ])
     else:
-        rows.append([KeyboardButton(BTN_TOOLS_BACK), KeyboardButton(page_badge), KeyboardButton(BTN_TOOLS_NEXT)])
+        rows.append([
+            styled_kb_btn(BTN_TOOLS_BACK, "danger"),
+            styled_kb_btn(page_badge),
+            styled_kb_btn(BTN_TOOLS_NEXT, "success"),
+        ])
 
-    rows.append([KeyboardButton("🏠 মেইন ড্যাশবোর্ডে ফিরুন")])
+    rows.append([styled_kb_btn(BTN_MENU, "primary")])
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
 
@@ -411,30 +438,21 @@ def build_tools_page_inline_kb(current_page: int = 1) -> InlineKeyboardMarkup:
     bn_nums = ["১", "২", "৩", "৪", "৫", "৬", "৭"]
     row_btns = []
     for idx in range(1, TOTAL_TOOL_PAGES + 1):
-        label = f"💠 {bn_nums[idx - 1]}" if idx == current_page else f"পেজ {bn_nums[idx - 1]}"
-        row_btns.append(InlineKeyboardButton(label, callback_data=f"tools_page:{idx}"))
+        if idx == current_page:
+            row_btns.append(styled_inline_btn(f"💠 {bn_nums[idx - 1]}", "success", callback_data=f"tools_page:{idx}"))
+        else:
+            row_btns.append(styled_inline_btn(f"পেজ {bn_nums[idx - 1]}", "primary", callback_data=f"tools_page:{idx}"))
     return InlineKeyboardMarkup([row_btns])
 
 
 def format_tools_page_card(page: int = 1) -> str:
     page = max(1, min(TOTAL_TOOL_PAGES, page))
-    page_data = PAGINATED_TOOLS_PAGES[page - 1]
-    tool_lines = []
-    for left_btn, right_btn in page_data["tools"]:
-        tool_lines.append(f"{left_btn}   │   {right_btn}")
-    tools_preview = "\n".join(tool_lines)
     bn_page = en_to_bn_digits(str(page))
     bn_total = en_to_bn_digits(str(TOTAL_TOOL_PAGES))
     return (
-        f"💠 <b>স্মার্ট AI ও ইউটিলিটি ভান্ডার ({page_data['title']})</b>\n"
+        f"🧰 <b>All Tools (পেজ {bn_page}/{bn_total})</b>\n"
         f"{DIVIDER}\n"
-        f"<blockquote>"
-        f"✨ এই পেজের <b>৬টি প্রিমিয়াম টুলস</b> নিচে কিবোর্ডে সাজানো হয়েছে:\n\n"
-        f"{tools_preview}\n\n"
-        f"💡 <i>কুইজ ও লাকি স্পিন পাবেন <b>পেজ ২</b>-এ!</i>"
-        f"</blockquote>\n"
-        f"📊 <b>পেজ ট্র্যাকার:</b> {page_data['dots']} (<b>পেজ {bn_page}/{bn_total}</b>)\n"
-        f"👇 <b>নিচের বাটন থেকে টুলস বেছে নিন অথবা পেজ পরিবর্তন করুন:</b>"
+        f"প্রতি পেজে ৬টি করে টুল দেখানো হচ্ছে। নিচের <b>Back / Next</b> বাটন দিয়ে পেজ পরিবর্তন করুন।"
     )
 
 
@@ -445,7 +463,7 @@ def get_all_tools_markup(user_id: Optional[int] = None) -> ReplyKeyboardMarkup:
 MAIN_MENU_MARKUP = get_main_menu_markup()
 
 PDF_COLLECT_MARKUP = ReplyKeyboardMarkup(
-    [[KeyboardButton(BTN_MAKE_PDF_DONE)], [KeyboardButton("🏠 মেইন ড্যাশবোর্ডে ফিরুন")]],
+    [[styled_kb_btn(BTN_MAKE_PDF_DONE, "success")], [styled_kb_btn(BTN_MENU, "primary")]],
     resize_keyboard=True,
 )
 
@@ -474,13 +492,14 @@ NORMALIZED_BUTTON_MAP: Dict[str, str] = {
     normalize_btn_text(b): b for b in ALL_BUTTON_CONSTANTS
 }
 
-# Executive Bangla Menu Aliases + Legacy Aliases
+# Executive Bangla Menu Aliases + Legacy Aliases (Full backward compatibility)
 MENU_ALIASES = {
+    "🧰 All Tools": BTN_ALL_TOOLS_VIEW,
+    "🧰 All Tools (সব টুলস)": BTN_ALL_TOOLS_VIEW,
+    "🧰 Wall Tools": BTN_ALL_TOOLS_VIEW,
     "✨ ফ্রি AI ও স্মার্ট টুলস ভান্ডার (৪০+ টুলস) 💠": BTN_ALL_TOOLS_VIEW,
     "ফ্রি AI ও স্মার্ট টুলস ভান্ডার (৪০+ টুলস)": BTN_ALL_TOOLS_VIEW,
     "✨ ফ্রি AI ও স্মার্ট টুলস ভান্ডার": BTN_ALL_TOOLS_VIEW,
-    "🧰 All Tools": BTN_ALL_TOOLS_VIEW,
-    "🧰 Wall Tools": BTN_ALL_TOOLS_VIEW,
     "🌈 🧰 All Tools ✨": BTN_ALL_TOOLS_VIEW,
     "🌈 🧰 All Tools ✨ (সব টুলস)": BTN_ALL_TOOLS_VIEW,
     "📋 সব বাটন একসাথে": BTN_ALL_TOOLS_VIEW,
@@ -496,6 +515,24 @@ MENU_ALIASES = {
     "⬅️ Back": BTN_TOOLS_BACK,
     "🟠 ⬅️ Back": BTN_TOOLS_BACK,
     "Back ⬅️": BTN_TOOLS_BACK,
+    "🔗 লিংক ছোট করুন": BTN_SHORTURL,
+    "🔗 লিংক ছোট": BTN_SHORTURL,
+    "❤️ Love ক্যালকুলেটর": BTN_LOVE,
+    "❤️ Love হিসাব": BTN_LOVE,
+    "📝 বানান ও Grammar": BTN_GRAMMAR,
+    "📝 বানান শুদ্ধি": BTN_GRAMMAR,
+    "📧 ইমেইল / আবেদনপত্র": BTN_EMAIL_CV,
+    "📧 ইমেইল ও CV": BTN_EMAIL_CV,
+    "🌙 স্বপ্ন ও ইসলামিক প্রশ্ন": BTN_DREAM_ISLAM,
+    "🌙 ইসলামিক প্রশ্ন": BTN_DREAM_ISLAM,
+    "🧮 অংক ও বিজ্ঞান সমাধান": BTN_MATH_SOLVE,
+    "🧮 অংক সমাধান": BTN_MATH_SOLVE,
+    "🩸 রক্তের গ্রুপ গাইড": BTN_BLOOD_INFO,
+    "🩸 রক্তের গ্রুপ": BTN_BLOOD_INFO,
+    "🥗 ডায়েট ও স্বাস্থ্য চার্ট": BTN_DIET_PLAN,
+    "🥗 ডায়েট চার্ট": BTN_DIET_PLAN,
+    "🎬 মুভি রিকমেন্ডেশন": BTN_MOVIE_REC,
+    "🎬 সেরা মুভি": BTN_MOVIE_REC,
     "👤 আমার প্রোফাইল": BTN_PROFILE,
     "আমার প্রোফাইল": BTN_PROFILE,
     "🏆 টপ লিডারবোর্ড": BTN_LEADERBOARD,
@@ -506,6 +543,7 @@ MENU_ALIASES = {
     "সাহায্য ও গাইড": BTN_HELP,
     "📩 অ্যাডমিন সাপোর্ট": BTN_CONTACT,
     "অ্যাডমিন সাপোর্ট": BTN_CONTACT,
+    "📩 সাপোর্ট": BTN_CONTACT,
     "ℹ️ বট পরিচিতি": BTN_ABOUT,
     "বট পরিচিতি": BTN_ABOUT,
     "👨‍💻 ডেভেলপার তথ্য": BTN_DEV,
@@ -3328,7 +3366,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"👥 <b>সক্রিয় কমিউনিটি:</b> {en_to_bn_digits(str(total_users))} জন সদস্য\n"
         f"💠 <b>স্মার্ট টুলস ভান্ডার:</b> ৭টি থিমযুক্ত পেজে ৪২টি প্রিমিয়াম টুলস"
         f"</blockquote>\n\n"
-        f"👇 <b>নিচের <code>✨ ফ্রি AI ও স্মার্ট টুলস ভান্ডার (৪০+ টুলস) 💠</code> বাটনে ট্যাপ করে কুইজ, স্পিন ও সবগুলো টুলস ব্যবহার করুন:</b>"
+        f"👇 <b>নিচের <code>🧰 All Tools</code> বাটনে ট্যাপ করে কুইজ, স্পিন ও সবগুলো টুলস ব্যবহার করুন:</b>"
     )
 
     markup = get_main_menu_markup(user.id)
