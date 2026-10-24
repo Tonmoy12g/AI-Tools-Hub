@@ -3231,12 +3231,93 @@ BASE_MENU_LAYOUT = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# MAKEOVER (presentation layer only — 2026-10-24)
+# Paginated reply-keyboard menu (6 tools per page, 7 pages), coloured
+# buttons (Bot API `style`, PTB 22+; graceful plain fallback on older PTB),
+# home system rows and the /start welcome banner. No tool logic, API call,
+# model, callback or database code is touched by this section.
+# ---------------------------------------------------------------------------
+BTN_PAGE_PREV = "⬅️ আগের পাতা"
+BTN_PAGE_NEXT = "পরের পাতা ➡️"
+MENU_PAGE_SIZE = 6
+MENU_TOOL_BUTTONS = [
+    BTN_AI_CHAT, BTN_TTS, BTN_STT, BTN_AI_IMG,
+    BTN_VID_DL, BTN_TRANSLATE, BTN_CAPTION, BTN_STORY,
+    BTN_IMG_PDF, BTN_PDF_SUM, BTN_PRAYER, BTN_WEATHER,
+    BTN_CURRENCY, BTN_SHORTURL, BTN_DICT, BTN_JOKES,
+    BTN_BMI, BTN_QR, BTN_NEWS, BTN_CRYPTO,
+    BTN_AGE, BTN_UNIT, BTN_FANCY, BTN_LOVE,
+    BTN_COMPRESS, BTN_LYRICS, BTN_PASSWORD, BTN_DUA,
+    BTN_REMINDER, BTN_QUIZ,
+    BTN_GRAMMAR, BTN_EMAIL_CV, BTN_CODE_HELP, BTN_BIO_GEN,
+    BTN_DREAM_ISLAM, BTN_MATH_SOLVE,
+    BTN_BLOOD_INFO, BTN_DIET_PLAN, BTN_BIZ_IDEA, BTN_MOVIE_REC,
+]
+MENU_TOTAL_PAGES = (len(MENU_TOOL_BUTTONS) + MENU_PAGE_SIZE - 1) // MENU_PAGE_SIZE
+_MENU_PAGE: Dict[int, int] = {}
+
+
+def _mkb(text: str, style: Optional[str] = None) -> KeyboardButton:
+    """Coloured button when the installed PTB supports `style` (22+);
+    plain button otherwise — never crashes on older PTB."""
+    if style:
+        try:
+            return KeyboardButton(text, style=style)
+        except TypeError:
+            pass
+    return KeyboardButton(text)
+
+
+def _btn_style(text: str) -> Optional[str]:
+    if text == BTN_SHOP:
+        return "success"
+    if text == BTN_CONTACT:
+        return "danger"
+    if text in MENU_TOOL_BUTTONS:
+        return "primary"
+    return None
+
+
+def get_menu_page(user_id: Optional[int]) -> int:
+    if not user_id:
+        return 1
+    return max(1, min(MENU_TOTAL_PAGES, _MENU_PAGE.get(user_id, 1)))
+
+
+def set_menu_page(user_id: Optional[int], page: int) -> int:
+    page = max(1, min(MENU_TOTAL_PAGES, page))
+    if user_id:
+        _MENU_PAGE[user_id] = page
+    return page
+
+
+def _page_indicator(page: int) -> str:
+    return f"📄 পাতা {en_to_bn_digits(str(page))}/{en_to_bn_digits(str(MENU_TOTAL_PAGES))}"
+
+
 def get_main_menu_markup(user_id: Optional[int] = None) -> ReplyKeyboardMarkup:
-    rows = [list(r) for r in BASE_MENU_LAYOUT]
+    page = get_menu_page(user_id)
+    start = (page - 1) * MENU_PAGE_SIZE
+    tools = MENU_TOOL_BUTTONS[start:start + MENU_PAGE_SIZE]
+    rows = []
+    for i in range(0, len(tools), 2):
+        rows.append([_mkb(t, "primary") for t in tools[i:i + 2]])
+    nav = []
+    if page > 1:
+        nav.append(_mkb(BTN_PAGE_PREV))
+    nav.append(_mkb(_page_indicator(page)))
+    if page < MENU_TOTAL_PAGES:
+        nav.append(_mkb(BTN_PAGE_NEXT))
+    rows.append(nav)
+    rows.append([_mkb(BTN_PROFILE), _mkb(BTN_SHOP, "success")])
+    rows.append([_mkb(BTN_ABOUT), _mkb(BTN_HELP), _mkb(BTN_DEV)])
+    rows.append([_mkb(BTN_LEADERBOARD), _mkb(BTN_DAILY), _mkb(BTN_SPIN)])
+    rows.append([_mkb(BTN_REFER), _mkb(BTN_CONTACT, "danger")])
     if user_id and is_admin(user_id):
-        rows.append([KeyboardButton(BTN_ADMIN_PANEL), KeyboardButton(BTN_MENU)])
+        rows.append([_mkb(BTN_ADMIN_PANEL), _mkb(BTN_MENU)])
     else:
-        rows.append([KeyboardButton(BTN_MENU)])
+        rows.append([_mkb(BTN_MENU)])
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
 
@@ -5762,6 +5843,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     context.user_data["state"] = None
+    set_menu_page(user.id, 1)
     total_users = get_total_users()
     u_row = get_user(user.id)
     pts = int(u_row["points"]) if u_row else 0
@@ -5778,11 +5860,28 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"</blockquote>\n\n"
         f"👇 <b>নিচের মেনু থেকে আপনার পছন্দের সেবাটি বেছে নিন:</b>"
     )
-    await update.effective_message.reply_text(
-        welcome_msg,
-        parse_mode=ParseMode.HTML,
-        reply_markup=get_main_menu_markup(user.id),
-    )
+    banner_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot_welcome_banner.jpg")
+    if os.path.exists(banner_path):
+        try:
+            with open(banner_path, "rb") as _banner_file:
+                await update.effective_message.reply_photo(
+                    photo=_banner_file,
+                    caption=welcome_msg,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=get_main_menu_markup(user.id),
+                )
+        except Exception:
+            await update.effective_message.reply_text(
+                welcome_msg,
+                parse_mode=ParseMode.HTML,
+                reply_markup=get_main_menu_markup(user.id),
+            )
+    else:
+        await update.effective_message.reply_text(
+            welcome_msg,
+            parse_mode=ParseMode.HTML,
+            reply_markup=get_main_menu_markup(user.id),
+        )
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -6527,9 +6626,32 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         context.user_data["state"] = None
         context.user_data.pop("pdf_images", None)
         context.user_data.pop("quiz", None)
+        set_menu_page(user.id, 1)
         await msg.reply_text(
             f"🏠 <b>মূল মেনুতে ফিরে এসেছেন</b>\n{DIVIDER}\n👇 নিচের বাটন থেকে আপনার পছন্দের যেকোনো অপশন বেছে নিন:",
             parse_mode=ParseMode.HTML,
+            reply_markup=get_main_menu_markup(user.id),
+        )
+        return
+
+    # 3b. Makeover: paginated menu navigation (presentation only)
+    if text == BTN_PAGE_PREV:
+        page = set_menu_page(user.id, get_menu_page(user.id) - 1)
+        await msg.reply_text(
+            f"{_page_indicator(page)} — টুল বেছে নিন 👇",
+            reply_markup=get_main_menu_markup(user.id),
+        )
+        return
+    if text == BTN_PAGE_NEXT:
+        page = set_menu_page(user.id, get_menu_page(user.id) + 1)
+        await msg.reply_text(
+            f"{_page_indicator(page)} — টুল বেছে নিন 👇",
+            reply_markup=get_main_menu_markup(user.id),
+        )
+        return
+    if text.startswith("📄 পাতা ") and text.endswith(f"/{en_to_bn_digits(str(MENU_TOTAL_PAGES))}"):
+        await msg.reply_text(
+            f"{_page_indicator(get_menu_page(user.id))} — টুল বেছে নিন 👇",
             reply_markup=get_main_menu_markup(user.id),
         )
         return

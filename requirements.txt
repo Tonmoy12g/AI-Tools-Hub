@@ -1,4 +1,4 @@
-python-telegram-bot[job-queue]>=21.0,<22.0
+python-telegram-bot[job-queue]>=22.0
 Flask>=3.0.0
 requests>=2.31.0
 edge-tts>=6.1.9
