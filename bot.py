@@ -3232,14 +3232,16 @@ BASE_MENU_LAYOUT = [
 
 
 # ---------------------------------------------------------------------------
-# MAKEOVER (presentation layer only — 2026-10-24)
-# Paginated reply-keyboard menu (6 tools per page, 7 pages), coloured
-# buttons (Bot API `style`, PTB 22+; graceful plain fallback on older PTB),
-# home system rows and the /start welcome banner. No tool logic, API call,
-# model, callback or database code is touched by this section.
+# MAKEOVER v2 (presentation layer only — 2026-10-24)
+# Friend-style two-level menu: a clean home screen (system buttons only)
+# plus an "All Tools" section with paginated tool pages (6 tools/page).
+# Coloured buttons use Bot API `style` (PTB 22+; plain fallback on older
+# PTB). No tool logic, API call, model, callback or database code is
+# touched by this section.
 # ---------------------------------------------------------------------------
-BTN_PAGE_PREV = "⬅️ আগের পাতা"
-BTN_PAGE_NEXT = "পরের পাতা ➡️"
+BTN_ALL_TOOLS = "🧱 All Tools"
+BTN_PAGE_PREV = "⬅️ Back"
+BTN_PAGE_NEXT = "➡️ Next"
 MENU_PAGE_SIZE = 6
 MENU_TOOL_BUTTONS = [
     BTN_AI_CHAT, BTN_TTS, BTN_STT, BTN_AI_IMG,
@@ -3256,27 +3258,21 @@ MENU_TOOL_BUTTONS = [
 ]
 MENU_TOTAL_PAGES = (len(MENU_TOOL_BUTTONS) + MENU_PAGE_SIZE - 1) // MENU_PAGE_SIZE
 _MENU_PAGE: Dict[int, int] = {}
+TOOLS_HEADER_TEXT = (
+    "🧱 All Tools\n"
+    "প্রতি পেজে ৬টি করে টুল দেখানো হচ্ছে। নিচের Back / Next বাটন দিয়ে পেজ পরিবর্তন করুন।"
+)
 
 
-def _mkb(text: str, style: Optional[str] = None) -> KeyboardButton:
-    """Coloured button when the installed PTB supports `style` (22+);
-    plain button otherwise — never crashes on older PTB."""
+def _mkb(text: str, style: Optional[str] = "primary") -> KeyboardButton:
+    """Every menu button is coloured (default blue `primary`); plain
+    button only as fallback when the installed PTB lacks `style` (pre-22)."""
     if style:
         try:
             return KeyboardButton(text, style=style)
         except TypeError:
             pass
     return KeyboardButton(text)
-
-
-def _btn_style(text: str) -> Optional[str]:
-    if text == BTN_SHOP:
-        return "success"
-    if text == BTN_CONTACT:
-        return "danger"
-    if text in MENU_TOOL_BUTTONS:
-        return "primary"
-    return None
 
 
 def get_menu_page(user_id: Optional[int]) -> int:
@@ -3293,10 +3289,26 @@ def set_menu_page(user_id: Optional[int], page: int) -> int:
 
 
 def _page_indicator(page: int) -> str:
-    return f"📄 পাতা {en_to_bn_digits(str(page))}/{en_to_bn_digits(str(MENU_TOTAL_PAGES))}"
+    return f"📄 {page}/{MENU_TOTAL_PAGES}"
 
 
 def get_main_menu_markup(user_id: Optional[int] = None) -> ReplyKeyboardMarkup:
+    """Home screen — system buttons only, friend-style rows."""
+    rows = [
+        [_mkb(BTN_ALL_TOOLS, "primary")],
+        [_mkb(BTN_CONTACT, "danger")],
+        [_mkb(BTN_PROFILE), _mkb(BTN_LEADERBOARD)],
+        [_mkb(BTN_DAILY), _mkb(BTN_REFER)],
+        [_mkb(BTN_ABOUT), _mkb(BTN_HELP)],
+        [_mkb(BTN_DEV)],
+    ]
+    if user_id and is_admin(user_id):
+        rows.append([_mkb(BTN_ADMIN_PANEL)])
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True)
+
+
+def get_tools_menu_markup(user_id: Optional[int] = None) -> ReplyKeyboardMarkup:
+    """Paginated tool pages (6 tools per page) with Back/Next + Menu."""
     page = get_menu_page(user_id)
     start = (page - 1) * MENU_PAGE_SIZE
     tools = MENU_TOOL_BUTTONS[start:start + MENU_PAGE_SIZE]
@@ -3310,21 +3322,14 @@ def get_main_menu_markup(user_id: Optional[int] = None) -> ReplyKeyboardMarkup:
     if page < MENU_TOTAL_PAGES:
         nav.append(_mkb(BTN_PAGE_NEXT))
     rows.append(nav)
-    rows.append([_mkb(BTN_PROFILE), _mkb(BTN_SHOP, "success")])
-    rows.append([_mkb(BTN_ABOUT), _mkb(BTN_HELP), _mkb(BTN_DEV)])
-    rows.append([_mkb(BTN_LEADERBOARD), _mkb(BTN_DAILY), _mkb(BTN_SPIN)])
-    rows.append([_mkb(BTN_REFER), _mkb(BTN_CONTACT, "danger")])
-    if user_id and is_admin(user_id):
-        rows.append([_mkb(BTN_ADMIN_PANEL), _mkb(BTN_MENU)])
-    else:
-        rows.append([_mkb(BTN_MENU)])
+    rows.append([_mkb(BTN_MENU)])
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
 
 MAIN_MENU_MARKUP = get_main_menu_markup()
 
 PDF_COLLECT_MARKUP = ReplyKeyboardMarkup(
-    [[KeyboardButton(BTN_MAKE_PDF_DONE)], [KeyboardButton(BTN_MENU)]],
+    [[_mkb(BTN_MAKE_PDF_DONE, "primary")], [_mkb(BTN_MENU, "primary")]],
     resize_keyboard=True,
 )
 
@@ -6634,25 +6639,32 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return
 
-    # 3b. Makeover: paginated menu navigation (presentation only)
-    if text == BTN_PAGE_PREV:
-        page = set_menu_page(user.id, get_menu_page(user.id) - 1)
+    # 3b. Makeover: All Tools section + paginated navigation (presentation only)
+    if text == BTN_ALL_TOOLS:
+        set_menu_page(user.id, 1)
         await msg.reply_text(
-            f"{_page_indicator(page)} — টুল বেছে নিন 👇",
-            reply_markup=get_main_menu_markup(user.id),
+            TOOLS_HEADER_TEXT,
+            reply_markup=get_tools_menu_markup(user.id),
+        )
+        return
+    if text == BTN_PAGE_PREV:
+        set_menu_page(user.id, get_menu_page(user.id) - 1)
+        await msg.reply_text(
+            TOOLS_HEADER_TEXT,
+            reply_markup=get_tools_menu_markup(user.id),
         )
         return
     if text == BTN_PAGE_NEXT:
-        page = set_menu_page(user.id, get_menu_page(user.id) + 1)
+        set_menu_page(user.id, get_menu_page(user.id) + 1)
         await msg.reply_text(
-            f"{_page_indicator(page)} — টুল বেছে নিন 👇",
-            reply_markup=get_main_menu_markup(user.id),
+            TOOLS_HEADER_TEXT,
+            reply_markup=get_tools_menu_markup(user.id),
         )
         return
-    if text.startswith("📄 পাতা ") and text.endswith(f"/{en_to_bn_digits(str(MENU_TOTAL_PAGES))}"):
+    if text.startswith("📄 ") and text.endswith(f"/{MENU_TOTAL_PAGES}"):
         await msg.reply_text(
-            f"{_page_indicator(get_menu_page(user.id))} — টুল বেছে নিন 👇",
-            reply_markup=get_main_menu_markup(user.id),
+            TOOLS_HEADER_TEXT,
+            reply_markup=get_tools_menu_markup(user.id),
         )
         return
 
