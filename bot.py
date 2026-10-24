@@ -1862,7 +1862,7 @@ ABOUT_TEXT = (
     "🎁 <b>প্রোফাইল, রিওয়ার্ড ও সাপোর্ট ড্যাশবোর্ড:</b>\n"
     "<blockquote>"
     "৪১. <b>🎰 স্পিন (পেজ ২)</b> — প্রতিদিন লাকি স্পিনে ১–৫০ পয়েন্ট জয়ের সুযোগ\n"
-    "৪২. <b>👤 আমার প্রোফাইল</b> — নিজের পয়েন্ট, লেভেল, র‍্যাংক ও রেফারেল লিংক\n"
+    "৪২. <b>👤 আমার প্রোফাইল</b> — নিজের পয়েন্ট, লেভেল, র‍্যাঙ্ক ও রেফারেল লিংক\n"
     "৪৩. <b>🏆 টপ লিডারবোর্ড</b> — সর্বকালের সেরা ১০ ও সাপ্তাহিক সেরা ৫ জনের তালিকা\n"
     "৪৪. <b>🎁 ডেইলি বোনাস</b> — প্রতিদিন ফ্রি +৫ পয়েন্ট বোনাস\n"
     "৪৫. <b>👥 রেফার ও পয়েন্ট</b> — বন্ধু আমন্ত্রণ জানিয়ে প্রতি রেফারে +১০ পয়েন্ট\n"
@@ -13130,11 +13130,11 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     lvl = get_level_name(pts)
 
     welcome_msg = (
-        f"✨ <b>আসসালামু আলাইকুম, {html.escape(full_name)}!</b>\n"
+        f"✨ <b>আসসালামু আলাইকুম!</b>\n"
         f"{DIVIDER}\n"
         f"🚀 <b>AI Tools Hub Pro — স্মার্ট বাংলা স্টুডিওতে স্বাগতম!</b>\n\n"
         f"<blockquote>"
-        f"🏅 <b>আপনার র‍্যাংক:</b> {lvl} ({en_to_bn_digits(str(pts))} পয়েন্ট)\n"
+        f"🏅 <b>আপনার র‍্যাঙ্ক:</b> {lvl} ({en_to_bn_digits(str(pts))} পয়েন্ট)\n"
         f"👥 <b>সক্রিয় কমিউনিটি:</b> {en_to_bn_digits(str(total_users))} জন সদস্য\n"
         f"💠 <b>স্মার্ট টুলস ভান্ডার:</b> ৭টি থিমযুক্ত পেজে ৪২টি প্রিমিয়াম টুলস"
         f"</blockquote>\n\n"
@@ -14762,7 +14762,7 @@ async def route_menu_button(
                 f"💎 <b>অ্যাকাউন্ট স্ট্যাটাস:</b> {vip_status}\n"
                 f"⭐ <b>মোট পয়েন্ট:</b> {pts}\n"
                 f"🏅 <b>লেভেল:</b> {lvl}\n"
-                f"🏆 <b>গ্লোবাল র‍্যাংক:</b> #{rank}\n"
+                f"🏆 <b>গ্লোবাল র‍্যাঙ্ক:</b> #{rank}\n"
                 f"👥 <b>মোট রেফারেল:</b> {refs} জন"
                 f"</blockquote>\n\n"
                 f"🔗 <b>আপনার রেফারেল লিংক:</b>\n<code>{ref_link}</code>",
@@ -14800,7 +14800,7 @@ async def route_menu_button(
                 f"<blockquote>" + ("\n".join(all_lines) if all_lines else "এখনো কেউ নেই") + "</blockquote>\n\n"
                 f"🔥 <b>এই সপ্তাহের সেরা ৫ জন (This Week Top 5):</b>\n"
                 f"<blockquote>" + ("\n".join(week_lines) if week_lines else "এখনো কেউ নেই") + "</blockquote>\n\n"
-                f"👤 <b>আপনার অবস্থান:</b> র‍্যাংক <b>#{my_rank}</b> ({my_pts} পয়েন্ট)",
+                f"👤 <b>আপনার অবস্থান:</b> র‍্যাঙ্ক <b>#{my_rank}</b> ({my_pts} পয়েন্ট)",
                 parse_mode=ParseMode.HTML,
             )
 
