@@ -13123,6 +13123,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
+    if not await check_force_join(update, context):
+        return
+
     context.user_data["state"] = None
     total_users = get_total_users()
     u_row = get_user(user.id)
