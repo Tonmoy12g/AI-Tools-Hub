@@ -291,10 +291,9 @@ CAT_CALC_PDF = "🟠 দরকারি টুলস ও PDF"
 CAT_LIFE_FUN = "🟡 লাইফস্টাইল ও বিনোদন"
 CAT_REWARD_SHOP = "🔴 বোনাস, কুইজ ও প্রোফাইল"
 
-# Original Executive Main Menu Layout (No Shop, Spin & Quiz moved to Tools Explorer)
+# Original Executive Main Menu Layout (All tools including AI Chat, AI Image, Spin & Quiz are inside Tools Pages)
 CLEAN_MAIN_MENU_LAYOUT = [
     [KeyboardButton(BTN_ALL_TOOLS_VIEW)],
-    [KeyboardButton("🟣 " + BTN_AI_CHAT), KeyboardButton("🟢 " + BTN_AI_IMG)],
     [KeyboardButton("🔵 👤 আমার প্রোফাইল"), KeyboardButton("🟡 🏆 টপ লিডারবোর্ড")],
     [KeyboardButton("🟠 🎁 ডেইলি বোনাস"), KeyboardButton("🌸 👥 রেফার ও পয়েন্ট")],
     [KeyboardButton("🩵 ❓ সাহায্য ও গাইড"), KeyboardButton("💎 📩 অ্যাডমিন সাপোর্ট")],
